@@ -1,0 +1,269 @@
+from functools import partial
+from math import sqrt
+from typing import NamedTuple
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from torch import nn
+from torchdeq import get_deq
+
+from neqnn.systems import (
+    entropy_production,
+    m_plefka_t_1_t_naive_mf,
+    td_corr_plefka_t_1_t_naive_mf,
+    theta,
+)
+
+
+#
+# spin-transformer module
+#
+
+
+def scale_from_dim(dim: int) -> float:
+    return sqrt(dim / 2 - 1)
+
+
+class MeanFieldState(NamedTuple):
+    theta: torch.Tensor | None
+
+
+class SpinTransformerModule(nn.Module):
+    """
+    Example of a transformer module wrapping around the mean-field dynamics of a
+    da vector-spin system. Implements parallel attention with focus on simplicity
+    (vanilla softmax attention and simple feed-forward).
+
+    TODO (mbal):
+    - add support for some kind of positional embedding
+    """
+
+    def __init__(
+        self,
+        *,
+        dim,  # vector dimension
+        num_heads,  # number of subspaces to parallelize attention across
+        causal: bool = False,  # whether to impose causal mask on attention matrix
+        beta: float = 1.0,  # inverse temperature of vector-spin system
+        num_steps: int | None = 1,  # time steps to take (None = time-evolution fp)
+        fp_solver_max_iter: int | None = None,  # max_iter of fixed-point solver
+        fp_solver_tol: float | None = None,  # tolerance of fixed-point solver
+        return_sigma: bool = False,  # add entropy production to output tuple
+    ):
+        super().__init__()
+
+        assert num_heads == 1, "TODO: figure about appropriate norm scale for mha case"
+
+        self.dim = dim
+        self.dim_head = dim // num_heads
+        self.dim_attn_inner = self.dim_head * num_heads
+        self.num_heads = num_heads
+
+        self.scale = scale_from_dim(self.dim)
+        self.scale_head = scale_from_dim(self.dim_head)
+
+        self.causal = causal
+        self.register_buffer("causal_mask", None, persistent=False)
+        self.beta = beta
+        self.return_sigma = return_sigma
+
+        # attention params
+        self.to_qk = nn.Linear(dim, 2 * self.dim_attn_inner, bias=False)
+
+        # memory params
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, 4 * dim, bias=False),
+            nn.GELU(),
+            nn.Linear(4 * dim, dim, bias=False),
+        )
+
+        # time-delayed correlations
+        self.td_corr = partial(
+            td_corr_plefka_t_1_t_naive_mf, beta=self.beta, scale=self.scale
+        )
+
+        # magnetizations
+        self.magnetizations = partial(
+            m_plefka_t_1_t_naive_mf, beta=self.beta, scale=self.scale
+        )
+
+        # step (either take `num_steps` or find fixed point)
+        if num_steps is not None:
+
+            def _inner_loop(_m0, _x, _J):
+                for i in range(num_steps):
+                    state = theta(_x, _J, _m0)
+                    m = self.magnetizations(state)
+                    if i < num_steps - 1:
+                        _m0 = m  # TODO: can also detach() here (inner iteration)
+                return m, state
+
+            self.step = _inner_loop
+        else:
+
+            def _fixed_point(_m0, _x, _J, *, _solver):
+                z_out, _ = _solver(
+                    lambda _m: self.magnetizations(theta(_x, _J, _m)),
+                    self.magnetizations(theta(_x, _J, _m0)),
+                )
+                m = z_out[-1]
+                return m, theta(_x, _J, m)
+
+            self.step = partial(
+                _fixed_point,
+                _solver=get_deq(
+                    f_solver="anderson",
+                    f_max_iter=(
+                        fp_solver_max_iter if fp_solver_max_iter is not None else 40
+                    ),
+                    f_tol=fp_solver_tol if fp_solver_tol is not None else 1e-4,
+                ),
+            )
+
+        # init mean-field state
+        self.prev_mf_state = MeanFieldState(theta=None)
+
+    def get_causal_mask(self, n, device):
+        if self.causal_mask is not None and self.causal_mask.shape[-1] >= n:
+            return self.causal_mask[:n, :n]
+        causal_mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        return causal_mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ):
+        seq_len, device = x.shape[1], x.device
+
+        # init previous mean-field state (first pass)
+        if self.prev_mf_state.theta is None:
+            self.prev_mf_state = self.prev_mf_state._replace(theta=torch.ones(x.size()))
+            # TODO (mbal): add padding logic to support shrinking / growing of `seq_len`
+
+        # normalize inputs to sphere at scale radius
+        x = self.scale * F.normalize(x, dim=-1)
+
+        # queries and keys from inputs
+        q, k = map(lambda t: F.normalize(t, dim=-1), self.to_qk(x).chunk(2, dim=-1))
+
+        # overlap
+        sim = self.scale * torch.einsum("... i d, ... j d -> ... i j", q, k)
+
+        # key mask
+        if mask is not None:
+            mask = rearrange(mask, "b j -> b 1 1 j")  # true -> keep
+            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
+
+        # causal mask
+        if self.causal:
+            causal_mask = self.get_causal_mask(seq_len, device)  # true -> mask
+            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+
+        # softmax attention
+        attn = sim.softmax(dim=-1)
+
+        # augment residual with ffn memory
+        x = x + self.ffn(x)
+
+        # update mean-field magnetizations
+        m0 = self.magnetizations(self.prev_mf_state.theta)
+        m, theta = self.step(m0, x, attn)
+
+        # store updated mean-field state
+        self.prev_mf_state = self.prev_mf_state._replace(theta=theta.detach())
+
+        # return magnetizations (and entropy production)
+        out = (m,)
+        if self.return_sigma:
+            out += (
+                entropy_production(
+                    self.beta, attn, self.td_corr(theta, attn, self.prev_mf_state.theta)
+                ),
+            )
+        return out
+
+
+#
+# spin-transformer model (stack of `SpinTransformerModule` layers)
+#
+
+
+class SpinTransformerModel(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        causal: bool = False,
+        beta: float = 1.0,
+        num_steps: int | None = 1,
+        fp_solver_max_iter: int | None = None,
+        fp_solver_tol: float | None = None,
+        detach_outputs: bool = False,
+        return_sigmas: bool = False,
+    ):
+        super().__init__()
+
+        self.layers = nn.ModuleList([])
+        for _ in range(num_layers):
+            self.layers.append(
+                SpinTransformerModule(
+                    dim=dim,
+                    num_heads=num_heads,
+                    causal=causal,
+                    beta=beta,
+                    num_steps=num_steps,
+                    fp_solver_max_iter=fp_solver_max_iter,
+                    fp_solver_tol=fp_solver_tol,
+                    return_sigma=return_sigmas,
+                )
+            )
+
+        self.detach_outputs = detach_outputs
+        self.return_sigmas = return_sigmas
+
+    def forward(self, x):
+        if self.return_sigmas:
+            sigmas = []
+
+        m = x
+        for layer in self.layers:
+            out = layer(m)
+            if self.return_sigmas:
+                m, sigma = out
+                sigmas.append(sigma)
+            else:
+                m = out
+            if self.detach_outputs:
+                m = m.detach()
+
+        if self.return_sigmas:
+            return m, sigmas
+        else:
+            return m
+
+
+if __name__ == "__main__":
+    torch.manual_seed(1234)
+
+    bsz, seq_len, dim = 1, 2048, 512
+
+    model = SpinTransformerModel(
+        num_layers=4,
+        dim=dim,
+        num_heads=1,
+        num_steps=1,
+        detach_outputs=True,
+        return_sigmas=True,
+    )
+
+    x = torch.randn((bsz, seq_len, dim))
+    y, sigmas = model(x)
+
+    (-sum(map(lambda x: x.mean(), sigmas))).backward()
+
+    for n, m in model.named_parameters():
+        print((n, m.grad))
