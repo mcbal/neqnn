@@ -32,18 +32,20 @@ class MeanFieldState(NamedTuple):
 class SpinTransformerModule(nn.Module):
     """
     Example of a transformer module wrapping around the mean-field dynamics of a
-    da vector-spin system. Implements parallel attention with focus on simplicity
-    (vanilla softmax attention and simple feed-forward).
+    vector-spin system. Implements parallel attention with focus on simplicity.
+    Multiple heads are implemented by splitting the vector dim, leading to multiple
+    parallel spin systems (head dim becomes another batch dim, not just for attention).
 
     TODO (mbal):
-    - add support for some kind of positional embedding
+    - Add support for some kind of positional embedding
     """
 
     def __init__(
         self,
         *,
         dim,  # vector dimension
-        num_heads,  # number of subspaces to parallelize attention across
+        num_heads,  # number of (dim // num_heads)-dimensional subspaces to split across
+        mix_heads: bool = False,  # whether to mix head outputs back to dim for num_heads > 1
         causal: bool = False,  # whether to impose causal mask on attention matrix
         beta: float = 1.0,  # inverse temperature of vector-spin system
         num_steps: int | None = 1,  # time steps to take (None = time-evolution fp)
@@ -53,29 +55,35 @@ class SpinTransformerModule(nn.Module):
     ):
         super().__init__()
 
-        assert num_heads == 1, "TODO: figure about appropriate norm scale for mha case"
-
         self.dim = dim
         self.dim_head = dim // num_heads
-        self.dim_attn_inner = self.dim_head * num_heads
+        self.dim_inner = self.dim_head * num_heads
         self.num_heads = num_heads
 
         self.scale = scale_from_dim(self.dim)
         self.scale_head = scale_from_dim(self.dim_head)
 
-        self.causal = causal
-        self.register_buffer("causal_mask", None, persistent=False)
         self.beta = beta
         self.return_sigma = return_sigma
+        self.causal = causal
+        self.register_buffer("causal_mask", None, persistent=False)
 
         # attention params
-        self.to_qk = nn.Linear(dim, 2 * self.dim_attn_inner, bias=False)
+        self.to_qk = nn.Linear(dim, 2 * self.dim_inner, bias=False)
 
         # memory params
         self.ffn = nn.Sequential(
-            nn.Linear(dim, 4 * dim, bias=False),
+            nn.Linear(self.dim, 4 * self.dim, bias=False),
             nn.GELU(),
-            nn.Linear(4 * dim, dim, bias=False),
+            nn.Linear(4 * self.dim, self.dim, bias=False),
+        )
+
+        # output mixing
+        mix_heads = mix_heads and not (
+            self.num_heads == 1 and self.dim_head == self.dim
+        )
+        self.mix_heads = (
+            nn.Linear(self.dim_inner, self.dim) if mix_heads else nn.Identity()
         )
 
         # time-delayed correlations
@@ -127,6 +135,7 @@ class SpinTransformerModule(nn.Module):
     def get_causal_mask(self, n, device):
         if self.causal_mask is not None and self.causal_mask.shape[-1] >= n:
             return self.causal_mask[:n, :n]
+
         causal_mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
         return causal_mask
@@ -136,21 +145,28 @@ class SpinTransformerModule(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
     ):
-        seq_len, device = x.shape[1], x.device
+        seq_len, device = x.shape[-2], x.device
 
-        # init previous mean-field state (first pass)
-        if self.prev_mf_state.theta is None:
-            self.prev_mf_state = self.prev_mf_state._replace(theta=torch.ones(x.size()))
-            # TODO (mbal): add padding logic to support shrinking / growing of `seq_len`
-
-        # normalize inputs to sphere at scale radius
+        # normalize inputs to sphere
         x = self.scale * F.normalize(x, dim=-1)
 
         # queries and keys from inputs
-        q, k = map(lambda t: F.normalize(t, dim=-1), self.to_qk(x).chunk(2, dim=-1))
+        q, k = self.to_qk(x).chunk(2, dim=-1)
+
+        # ff from inputs
+        ff = self.ffn(x)
+
+        # head dim becomes batch dim
+        x, q, k, ff = map(
+            lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.num_heads),
+            (x, q, k, ff),
+        )
+
+        # normalize queries and keys to unit sphere
+        q, k = map(lambda t: F.normalize(t, dim=-1), (q, k))
 
         # overlap
-        sim = self.scale * torch.einsum("... i d, ... j d -> ... i j", q, k)
+        sim = self.scale_head * torch.einsum("b h i d, b h j d -> b h i j", q, k)
 
         # key mask
         if mask is not None:
@@ -159,21 +175,31 @@ class SpinTransformerModule(nn.Module):
 
         # causal mask
         if self.causal:
-            causal_mask = self.get_causal_mask(seq_len, device)  # true -> mask
+            causal_mask = rearrange(
+                self.get_causal_mask(seq_len, device), "i j -> 1 1 i j"
+            )  # true -> mask
             sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         # softmax attention
-        attn = sim.softmax(dim=-1)
+        attn = sim.softmax(dim=-1)  # (b h n n)
+
+        # first pass: init previous mean-field state with all-ones
+        if self.prev_mf_state.theta is None:
+            self.prev_mf_state = self.prev_mf_state._replace(theta=torch.ones(x.size()))
+            # TODO (mbal): add padding logic to support shrinking / growing of `seq_len`
 
         # augment residual with ffn memory
-        x = x + self.ffn(x)
+        x = x + ff  # (b h n n)
 
         # update mean-field magnetizations
         m0 = self.magnetizations(self.prev_mf_state.theta)
-        m, theta = self.step(m0, x, attn)
+        m, theta = self.step(m0, x, attn)  # (b h n d), (b h n d)
 
         # store updated mean-field state
         self.prev_mf_state = self.prev_mf_state._replace(theta=theta.detach())
+
+        # rearrange (and mix) head outputs
+        m = self.mix_heads(rearrange(m, "b h n d -> b n (h d)"))
 
         # return magnetizations (and entropy production)
         out = (m,)
@@ -197,12 +223,13 @@ class SpinTransformerModel(nn.Module):
         num_layers: int,
         dim: int,
         num_heads: int,
+        mix_heads: bool = False,
         causal: bool = False,
         beta: float = 1.0,
         num_steps: int | None = 1,
         fp_solver_max_iter: int | None = None,
         fp_solver_tol: float | None = None,
-        detach_outputs: bool = False,
+        should_detach: bool = False,
         return_sigmas: bool = False,
     ):
         super().__init__()
@@ -213,6 +240,7 @@ class SpinTransformerModel(nn.Module):
                 SpinTransformerModule(
                     dim=dim,
                     num_heads=num_heads,
+                    mix_heads=mix_heads,
                     causal=causal,
                     beta=beta,
                     num_steps=num_steps,
@@ -222,7 +250,7 @@ class SpinTransformerModel(nn.Module):
                 )
             )
 
-        self.detach_outputs = detach_outputs
+        self.should_detach = should_detach
         self.return_sigmas = return_sigmas
 
     def forward(self, x):
@@ -237,7 +265,7 @@ class SpinTransformerModel(nn.Module):
                 sigmas.append(sigma)
             else:
                 m = out
-            if self.detach_outputs:
+            if self.should_detach:
                 m = m.detach()
 
         if self.return_sigmas:
@@ -254,9 +282,11 @@ if __name__ == "__main__":
     model = SpinTransformerModel(
         num_layers=4,
         dim=dim,
-        num_heads=1,
+        num_heads=4,
+        mix_heads=True,
         num_steps=1,
-        detach_outputs=True,
+        causal=True,
+        should_detach=True,
         return_sigmas=True,
     )
 
@@ -264,6 +294,8 @@ if __name__ == "__main__":
     y, sigmas = model(x)
 
     (-sum(map(lambda x: x.mean(), sigmas))).backward()
+
+    print(sigmas)
 
     for n, m in model.named_parameters():
         print((n, m.grad))
