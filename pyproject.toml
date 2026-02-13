@@ -5,7 +5,7 @@ requires = ["hatchling"]
 [project]
 name = "neqnn"
 version = "0.0.1"
-description = "Add your description here"
+description = "Entropy production in non-equilibrium transformer modules in PyTorch."
 authors = [{ name = "Matthias Bal", email = "matthiascbal@gmail.com" }]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -18,7 +18,20 @@ classifiers = [
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "einops>=0.8.2",
+    "numpy>=2.4.2",
+    "torch>=2.10.0",
+    "torchdeq>=0.1.0",
+]
+
+[project.optional-dependencies]
+audio = [
+    "sounddevice>=0.5.5",
+]
+video = [
+    "opencv-python>=4.13.0.92",
+]
 
 [tool.hatch.metadata]
 allow-direct-references = true
