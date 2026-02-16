@@ -5,6 +5,7 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from einops.layers.torch import Rearrange
 from torch import nn
 from torchdeq import get_deq
 
@@ -45,7 +46,8 @@ class SpinTransformerModule(nn.Module):
         *,
         dim,  # vector dimension
         num_heads,  # number of (dim // num_heads)-dimensional subspaces to split across
-        mix_heads: bool = False,  # whether to mix head outputs back to dim for num_heads > 1
+        pre_mix: bool = False,
+        post_mix: bool = False,
         causal: bool = False,  # whether to impose causal mask on attention matrix
         beta: float = 1.0,  # inverse temperature of vector-spin system
         num_steps: int | None = 1,  # time steps to take (None = time-evolution fp)
@@ -68,6 +70,9 @@ class SpinTransformerModule(nn.Module):
         self.causal = causal
         self.register_buffer("causal_mask", None, persistent=False)
 
+        self.split_heads = Rearrange("b n (h d) -> b h n d", h=self.num_heads)
+        self.merge_heads = Rearrange("b h n d -> b n (h d)")
+
         # attention params
         self.to_qk = nn.Linear(dim, 2 * self.dim_inner, bias=False)
 
@@ -78,12 +83,14 @@ class SpinTransformerModule(nn.Module):
             nn.Linear(4 * self.dim, self.dim, bias=False),
         )
 
-        # output mixing
-        mix_heads = mix_heads and not (
-            self.num_heads == 1 and self.dim_head == self.dim
+        # input/output mixing
+        self.pre_mix = (
+            nn.Linear(self.dim, self.dim, bias=False) if pre_mix else nn.Identity()
         )
-        self.mix_heads = (
-            nn.Linear(self.dim_inner, self.dim) if mix_heads else nn.Identity()
+        self.post_mix = (
+            nn.Linear(self.dim_inner, self.dim, bias=False)
+            if post_mix
+            else nn.Identity()
         )
 
         # time-delayed correlations
@@ -147,6 +154,9 @@ class SpinTransformerModule(nn.Module):
     ):
         seq_len, device = x.shape[-2], x.device
 
+        # maybe pre-mix inputs
+        x = self.pre_mix(x)
+
         # normalize inputs to sphere
         x = self.scale * F.normalize(x, dim=-1)
 
@@ -157,10 +167,7 @@ class SpinTransformerModule(nn.Module):
         ff = self.ffn(x)
 
         # head dim becomes batch dim
-        x, q, k, ff = map(
-            lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.num_heads),
-            (x, q, k, ff),
-        )
+        x, q, k, ff = map(self.split_heads, (x, q, k, ff))
 
         # normalize queries and keys to unit sphere
         q, k = map(lambda t: F.normalize(t, dim=-1), (q, k))
@@ -183,13 +190,13 @@ class SpinTransformerModule(nn.Module):
         # softmax attention
         attn = sim.softmax(dim=-1)  # (b h n n)
 
-        # first pass: init previous mean-field state with all-ones
+        # first fwd pass: init previous mean-field state with all-ones
         if self.prev_mf_state.theta is None:
             self.prev_mf_state = self.prev_mf_state._replace(theta=torch.ones(x.size()))
             # TODO (mbal): add padding logic to support shrinking / growing of `seq_len`
 
         # augment residual with ffn memory
-        x = x + ff  # (b h n n)
+        x = x + ff  # (b h n d)
 
         # update mean-field magnetizations
         m0 = self.magnetizations(self.prev_mf_state.theta)
@@ -198,8 +205,11 @@ class SpinTransformerModule(nn.Module):
         # store updated mean-field state
         self.prev_mf_state = self.prev_mf_state._replace(theta=theta.detach())
 
-        # rearrange (and mix) head outputs
-        m = self.mix_heads(rearrange(m, "b h n d -> b n (h d)"))
+        # rearrange head outputs
+        m = self.merge_heads(m)
+
+        # maybe post-mix outputs (but then `m` no longer corresponds to `theta` in mf state!)
+        m = self.post_mix(m)
 
         # return magnetizations (and entropy production)
         out = (m,)
@@ -223,7 +233,8 @@ class SpinTransformerModel(nn.Module):
         num_layers: int,
         dim: int,
         num_heads: int,
-        mix_heads: bool = False,
+        pre_mix: bool = False,
+        post_mix: bool = False,
         causal: bool = False,
         beta: float = 1.0,
         num_steps: int | None = 1,
@@ -240,7 +251,8 @@ class SpinTransformerModel(nn.Module):
                 SpinTransformerModule(
                     dim=dim,
                     num_heads=num_heads,
-                    mix_heads=mix_heads,
+                    pre_mix=pre_mix,
+                    post_mix=post_mix,
                     causal=causal,
                     beta=beta,
                     num_steps=num_steps,
@@ -267,6 +279,7 @@ class SpinTransformerModel(nn.Module):
                 m = out
             if self.should_detach:
                 m = m.detach()
+            print(m)
 
         if self.return_sigmas:
             return m, sigmas
@@ -283,7 +296,7 @@ if __name__ == "__main__":
         num_layers=4,
         dim=dim,
         num_heads=4,
-        mix_heads=True,
+        pre_mix=True,
         num_steps=1,
         causal=True,
         should_detach=True,
