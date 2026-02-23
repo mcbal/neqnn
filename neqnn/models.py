@@ -38,7 +38,7 @@ class SpinTransformerModule(nn.Module):
     parallel spin systems (head dim becomes another batch dim, not just for attention).
 
     TODO (mbal):
-    - Add support for some kind of positional embedding
+    - Add support for some kind of positional embedding (e.g., PoPE)
     """
 
     def __init__(
@@ -49,10 +49,10 @@ class SpinTransformerModule(nn.Module):
         pre_mix: bool = False,
         post_mix: bool = False,
         causal: bool = False,  # whether to impose causal mask on attention matrix
-        beta: float = 1.0,  # inverse temperature of vector-spin system
         num_steps: int | None = 1,  # time steps to take (None = time-evolution fp)
         fp_solver_max_iter: int | None = None,  # max_iter of fixed-point solver
         fp_solver_tol: float | None = None,  # tolerance of fixed-point solver
+        beta: float = 1.0,  # inverse temperature of vector-spin system
         return_sigma: bool = False,  # add entropy production to output tuple
     ):
         super().__init__()
@@ -65,11 +65,13 @@ class SpinTransformerModule(nn.Module):
         self.scale = scale_from_dim(self.dim)
         self.scale_head = scale_from_dim(self.dim_head)
 
-        self.beta = beta
-        self.return_sigma = return_sigma
         self.causal = causal
         self.register_buffer("causal_mask", None, persistent=False)
 
+        self.beta = beta
+        self.return_sigma = return_sigma
+
+        # head management
         self.split_heads = Rearrange("b n (h d) -> b h n d", h=self.num_heads)
         self.merge_heads = Rearrange("b h n d -> b n (h d)")
 
@@ -152,8 +154,6 @@ class SpinTransformerModule(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
     ):
-        seq_len, device = x.shape[-2], x.device
-
         # maybe pre-mix inputs
         x = self.pre_mix(x)
 
@@ -183,12 +183,14 @@ class SpinTransformerModule(nn.Module):
         # causal mask
         if self.causal:
             causal_mask = rearrange(
-                self.get_causal_mask(seq_len, device), "i j -> 1 1 i j"
+                self.get_causal_mask(x.size(-2), x.device), "i j -> 1 1 i j"
             )  # true -> mask
             sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         # softmax attention
         attn = sim.softmax(dim=-1)  # (b h n n)
+
+        # print(attn)
 
         # first fwd pass: init previous mean-field state with all-ones
         if self.prev_mf_state.theta is None:
@@ -196,6 +198,7 @@ class SpinTransformerModule(nn.Module):
             # TODO (mbal): add padding logic to support shrinking / growing of `seq_len`
 
         # augment residual with ffn memory
+        # print(torch.linalg.vector_norm(x, dim=-1), torch.linalg.vector_norm(ff, dim=-1))
         x = x + ff  # (b h n d)
 
         # update mean-field magnetizations
@@ -236,12 +239,12 @@ class SpinTransformerModel(nn.Module):
         pre_mix: bool = False,
         post_mix: bool = False,
         causal: bool = False,
-        beta: float = 1.0,
         num_steps: int | None = 1,
         fp_solver_max_iter: int | None = None,
         fp_solver_tol: float | None = None,
-        should_detach: bool = False,
+        beta: float = 1.0,
         return_sigmas: bool = False,
+        should_detach: bool = False,
     ):
         super().__init__()
 
@@ -262,8 +265,8 @@ class SpinTransformerModel(nn.Module):
                 )
             )
 
-        self.should_detach = should_detach
         self.return_sigmas = return_sigmas
+        self.should_detach = should_detach
 
     def forward(self, x):
         if self.return_sigmas:
@@ -279,7 +282,6 @@ class SpinTransformerModel(nn.Module):
                 m = out
             if self.should_detach:
                 m = m.detach()
-            print(m)
 
         if self.return_sigmas:
             return m, sigmas
@@ -298,9 +300,9 @@ if __name__ == "__main__":
         num_heads=4,
         pre_mix=True,
         num_steps=1,
-        causal=True,
-        should_detach=True,
+        causal=False,
         return_sigmas=True,
+        should_detach=True,
     )
 
     x = torch.randn((bsz, seq_len, dim))

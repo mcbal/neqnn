@@ -27,12 +27,10 @@ def phi(theta, beta, scale):
 
 
 def m_plefka_t_1_t_naive_mf(theta, *, beta, scale):
-    """Magnetizations."""
     return phi(theta, beta, scale)
 
 
 def td_corr_plefka_t_1_t_naive_mf(theta1, J1, theta0, *, beta, scale):
-    """Time-delayed correlations."""
     gamma1, gamma0 = map(lambda t: gamma(t, beta, scale), (theta1, theta0))
     m1, m0 = beta * theta1 / (1 + gamma1), beta * theta0 / (1 + gamma0)
     return (
