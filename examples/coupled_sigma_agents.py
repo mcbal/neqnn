@@ -468,8 +468,7 @@ def main():
             delta_b_to_a = rms(next_b_to_a - b_to_a)
             loop_delta = 0.5 * (delta_a_to_b + delta_b_to_a)
             one_step_alignment = 0.5 * (
-                cosine_mean(next_a_to_b, a_to_b)
-                + cosine_mean(next_b_to_a, b_to_a)
+                cosine_mean(next_a_to_b, a_to_b) + cosine_mean(next_b_to_a, b_to_a)
             )
             if prev_a_to_b is None or prev_b_to_a is None:
                 two_step_delta_a_to_b = loop_delta
