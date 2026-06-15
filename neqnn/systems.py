@@ -3,10 +3,9 @@ from einops import einsum, rearrange
 
 
 def entropy_production(beta, J, D):
-    return beta * (
-        einsum(J, D, "... i j, ... i j -> ... ")
-        - einsum(J, D, "... j i, ... i j -> ... ")
-    )
+    J_asym = J - J.transpose(-1, -2)
+    D_asym = D - D.transpose(-1, -2)
+    return 0.5 * beta * einsum(J_asym, D_asym, "... i j, ... i j -> ... ")
 
 
 #

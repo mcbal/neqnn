@@ -51,10 +51,13 @@ class SpinTransformerModule(nn.Module):
         num_steps: int | None = 1,  # time steps to take (None = time-evolution fp)
         fp_solver_max_iter: int | None = None,  # max_iter of fixed-point solver
         fp_solver_tol: float | None = None,  # tolerance of fixed-point solver
+        ffn_mode: str = "full",  # full = channel-mixing FFN, per_head = shared head-local FFN
         beta: float = 1.0,  # inverse temperature of vector-spin system
         return_sigma: bool = False,  # add entropy production to output tuple
     ):
         super().__init__()
+        if ffn_mode not in {"full", "per_head"}:
+            raise ValueError(f"unknown ffn_mode: {ffn_mode}")
 
         self.dim = dim
         self.dim_head = dim // num_heads
@@ -69,6 +72,7 @@ class SpinTransformerModule(nn.Module):
 
         self.beta = beta
         self.return_sigma = return_sigma
+        self.ffn_mode = ffn_mode
 
         # head management
         self.split_heads = Rearrange("b n (h d) -> b h n d", h=self.num_heads)
@@ -78,11 +82,18 @@ class SpinTransformerModule(nn.Module):
         self.to_qk = nn.Linear(dim, 2 * self.dim_inner, bias=False)
 
         # memory params
-        self.ffn = nn.Sequential(
-            nn.Linear(self.dim, 4 * self.dim, bias=False),
-            nn.GELU(),
-            nn.Linear(4 * self.dim, self.dim, bias=False),
-        )
+        if ffn_mode == "full":
+            self.ffn = nn.Sequential(
+                nn.Linear(self.dim, 4 * self.dim, bias=False),
+                nn.GELU(),
+                nn.Linear(4 * self.dim, self.dim, bias=False),
+            )
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(self.dim_head, 4 * self.dim_head, bias=False),
+                nn.GELU(),
+                nn.Linear(4 * self.dim_head, self.dim_head, bias=False),
+            )
 
         # input/output mixing
         self.pre_mix = (
@@ -94,14 +105,15 @@ class SpinTransformerModule(nn.Module):
             else nn.Identity()
         )
 
-        # time-delayed correlations
+        # time-delayed correlations. Heads are independent spin systems, so the
+        # vector-spin scale is set by the per-head dimension.
         self.td_corr = partial(
-            td_corr_plefka_t_1_t_naive_mf, beta=self.beta, scale=self.scale
+            td_corr_plefka_t_1_t_naive_mf, beta=self.beta, scale=self.scale_head
         )
 
         # magnetizations
         self.magnetizations = partial(
-            m_plefka_t_1_t_naive_mf, beta=self.beta, scale=self.scale
+            m_plefka_t_1_t_naive_mf, beta=self.beta, scale=self.scale_head
         )
 
         # step (either take `num_steps` or find fixed point)
@@ -163,10 +175,12 @@ class SpinTransformerModule(nn.Module):
         q, k = self.to_qk(x).chunk(2, dim=-1)
 
         # ff from inputs
-        ff = self.ffn(x)
-
-        # head dim becomes batch dim
-        x, q, k, ff = map(self.split_heads, (x, q, k, ff))
+        if self.ffn_mode == "full":
+            ff = self.ffn(x)
+            x, q, k, ff = map(self.split_heads, (x, q, k, ff))
+        else:
+            x, q, k = map(self.split_heads, (x, q, k))
+            ff = self.ffn(x)
 
         # normalize queries and keys to unit sphere
         q, k = map(lambda t: F.normalize(t, dim=-1), (q, k))
@@ -242,6 +256,7 @@ class SpinTransformerModel(nn.Module):
         num_steps: int | None = 1,
         fp_solver_max_iter: int | None = None,
         fp_solver_tol: float | None = None,
+        ffn_mode: str = "full",
         beta: float = 1.0,
         return_sigmas: bool = False,
         should_detach: bool = False,
@@ -261,6 +276,7 @@ class SpinTransformerModel(nn.Module):
                     num_steps=num_steps,
                     fp_solver_max_iter=fp_solver_max_iter,
                     fp_solver_tol=fp_solver_tol,
+                    ffn_mode=ffn_mode,
                     return_sigma=return_sigmas,
                 )
             )
