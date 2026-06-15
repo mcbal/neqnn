@@ -16,7 +16,6 @@ from neqnn.systems import (
     theta,
 )
 
-
 #
 # spin-transformer module
 #
@@ -198,15 +197,12 @@ class SpinTransformerModule(nn.Module):
             # TODO (mbal): add padding logic to support shrinking / growing of `seq_len`
 
         # augment residual with ffn memory
-        # print(torch.linalg.vector_norm(x, dim=-1), torch.linalg.vector_norm(ff, dim=-1))
         x = x + ff  # (b h n d)
 
         # update mean-field magnetizations
-        m0 = self.magnetizations(self.prev_mf_state.theta)
+        prev_theta = self.prev_mf_state.theta
+        m0 = self.magnetizations(prev_theta)
         m, theta = self.step(m0, x, attn)  # (b h n d), (b h n d)
-
-        # store updated mean-field state
-        self.prev_mf_state = self.prev_mf_state._replace(theta=theta.detach())
 
         # rearrange head outputs
         m = self.merge_heads(m)
@@ -219,10 +215,14 @@ class SpinTransformerModule(nn.Module):
         if self.return_sigma:
             out += (
                 entropy_production(
-                    self.beta, attn, self.td_corr(theta, attn, self.prev_mf_state.theta)
+                    self.beta, attn, self.td_corr(theta, attn, prev_theta)
                 ),
             )
-        return out
+
+        # store updated mean-field state after all previous-state operations
+        self.prev_mf_state = self.prev_mf_state._replace(theta=theta.detach())
+
+        return out if self.return_sigma else out[0]
 
 
 #
