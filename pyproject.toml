@@ -5,7 +5,7 @@ requires = ["hatchling"]
 [project]
 name = "neqnn"
 version = "0.0.1"
-description = "Entropy production in non-equilibrium transformer modules in PyTorch."
+description = "Nonequilibrium dynamics in spin-model transformers."
 authors = [{ name = "Matthias Bal", email = "matthiascbal@gmail.com" }]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -20,9 +20,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "einops>=0.8.2",
+    "matplotlib>=3.10.0",
     "numpy>=2.4.2",
     "torch>=2.10.0",
-    "torchdeq>=0.1.0",
     "tqdm>=4.67.3",
 ]
 
