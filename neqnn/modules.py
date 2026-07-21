@@ -48,6 +48,34 @@ class MeanFieldState(NamedTuple):
     magnetizations: Tensor
 
 
+def advance(
+    state: MeanFieldState, *, drop: int = 1, add: int = 1, fill: Tensor | None = None
+) -> MeanFieldState:
+    """Realign carried magnetizations after the window moves along the stream.
+
+    ``drop`` sites leave the front and ``add`` arrive at the back, so a sliding
+    window is ``drop=add=1`` and a growing one is ``drop=0``.  Without this the
+    carried state would be misaligned by one site per step and would describe the
+    wrong tokens entirely.
+
+    Arriving sites are unmagnetized by default, which is the per-site version of
+    the reset initialization: a token that just entered the window genuinely has
+    no relaxation history.  Pass ``fill`` to seed them with an amortized guess
+    instead.
+    """
+    magnetizations = state.magnetizations[..., drop:, :]
+    if add:
+        tail = (
+            fill
+            if fill is not None
+            else magnetizations.new_zeros(
+                *magnetizations.shape[:-2], add, magnetizations.shape[-1]
+            )
+        )
+        magnetizations = torch.cat([magnetizations, tail], dim=-2)
+    return MeanFieldState(magnetizations=magnetizations)
+
+
 class Readout(NamedTuple):
     magnetizations: Tensor
     state: MeanFieldState
@@ -76,6 +104,9 @@ class SpinModelTransformerModule(nn.Module):
         max_iter: int = 40,
         tol: float = 1e-5,
         ffn: bool = True,
+        qk_norm: bool = True,
+        rope: bool = False,
+        rope_base: float = 10_000.0,
         pre_mix: bool = False,
         post_mix: bool = False,
         measure_entropy_production: bool = False,
@@ -93,6 +124,9 @@ class SpinModelTransformerModule(nn.Module):
         self.init = init
         self.beta = beta
         self.causal = causal
+        self.qk_norm = qk_norm
+        self.rope = rope
+        self.rope_base = rope_base
         self.max_iter = max_iter
         self.tol = tol
         self.measure_entropy_production = measure_entropy_production
@@ -102,6 +136,22 @@ class SpinModelTransformerModule(nn.Module):
 
         self.to_qk = nn.Linear(dim, 2 * dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
+
+        # Ordinary RMS norm, with the physics living entirely in the init: a
+        # uniform gain of R / sqrt(dim_head) makes every drive start with norm
+        # exactly R.  RMS rather than layer norm because subtracting the mean
+        # would remove the component along the all-ones vector, an arbitrary
+        # coordinate axis with no meaning for spins on a sphere.  The affine is
+        # what lets norms later differ per token, as they do in a transformer.
+        self.drive_norm = nn.RMSNorm(self.dim_head, elementwise_affine=True)
+        nn.init.constant_(self.drive_norm.weight, self.radius_head / self.dim_head**0.5)
+
+        # Attention sharpness.  A fixed 1/sqrt(d) works when queries and keys are
+        # unnormalized, because training sharpens attention by growing their
+        # norms.  `qk_norm` pins those norms to 1 and removes that lever
+        # entirely, so the scale has to come back as an explicit parameter --
+        # the same pairing QK-norm architectures use.
+        self.attn_temperature = nn.Parameter(torch.tensor(float(self.dim_head) ** 0.5))
 
         # Disabling drops the memory term from the drive entirely.  It cannot be
         # an nn.Identity: the drive is ``x + f_FFN(x)``, so an identity would
@@ -119,6 +169,7 @@ class SpinModelTransformerModule(nn.Module):
         self.post_mix = nn.Linear(dim, dim, bias=False) if post_mix else nn.Identity()
 
         self.register_buffer("causal_mask", None, persistent=False)
+        self.register_buffer("rope_cache", None, persistent=False)
 
     #
     # Drive-dependent quantities.  These depend on X_t only, so they are shared
@@ -126,22 +177,64 @@ class SpinModelTransformerModule(nn.Module):
     #
 
     def normalize(self, x: Tensor) -> Tensor:
-        """Put every head's slice on its own sphere of radius R(dim_head).
+        """Fix the scale of each head's slice of the drive.
 
-        Normalizing per head rather than once over ``dim`` is what makes
-        ``||x_head|| = R_head`` hold exactly, which is the scale the mean-field
-        expressions assume.
+        R is the radius the *microscopic spins* live on, and magnetizations are
+        bounded by it by construction.  The drive is under no such obligation.
+        Spins are pure direction; fields are not, and their magnitude is
+        physical -- ``kappa = beta R ||h||`` is how hard a site is pinned -- so
+        forcing every drive onto one sphere throws that away.
+
+        Plain layer norm also puts every vector on a sphere; the per-token norm
+        variation in a transformer comes entirely from the learnable gain, which
+        makes the radius depend on direction.  The gain is uniform at init, so
+        norms all start at R, and training is free to spread them.
         """
-        x = self.split_heads(self.pre_mix(x))
-        return self.merge_heads(self.radius_head * F.normalize(x, dim=-1))
+        return self.merge_heads(self.drive_norm(self.split_heads(self.pre_mix(x))))
+
+    def rotary(self, n: int, device, dtype) -> tuple[Tensor, Tensor]:
+        """Rotary angles for relative positions, cached on the buffer.
+
+        Rotating queries and keys by their absolute position makes the logit
+        depend on ``j - i`` alone, which is exactly the invariance a sliding
+        window needs: shift every site by one and the couplings between
+        surviving pairs are unchanged.  Absolute site embeddings would break
+        that and make carried state describe the wrong tokens.
+        """
+        if self.rope_cache is not None and self.rope_cache.shape[-2] >= n:
+            cached = self.rope_cache[..., :n, :]
+            return cached[0], cached[1]
+        power = torch.arange(0, self.dim_head, 2, device=device, dtype=dtype) / self.dim_head
+        angles = torch.outer(torch.arange(n, device=device, dtype=dtype), self.rope_base**-power)
+        self.register_buffer("rope_cache", torch.stack([angles.cos(), angles.sin()]), persistent=False)
+        return angles.cos(), angles.sin()
+
+    def apply_rotary(self, t: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        even, odd = t[..., 0::2], t[..., 1::2]
+        return torch.stack([even * cos - odd * sin, even * sin + odd * cos], dim=-1).flatten(-2)
 
     def drive_and_couplings(self, x: Tensor, mask: Tensor | None) -> tuple[Tensor, Tensor]:
-        """The frozen-drive field ``x + f_FFN(x)`` and the coupling rule J(X_t)."""
+        """The frozen-drive field ``x + f_FFN(x)`` and the coupling rule J(X_t).
+
+        With ``qk_norm`` the logit is ``R_head cos(q, k)``, bounded by the head
+        radius whatever the weights do -- stable, but it also means query and key
+        *magnitude* carries no information and the usual lever on attention
+        sharpness is disconnected.  Without it the logit is the plain scaled dot
+        product, so norms are free to grow and sharpen the couplings.
+        """
         queries, keys = self.to_qk(x).chunk(2, dim=-1)
         drive = self.split_heads(x if self.ffn is None else x + self.ffn(x))
-        queries, keys = map(lambda t: F.normalize(self.split_heads(t), dim=-1), (queries, keys))
+        queries, keys = map(self.split_heads, (queries, keys))
 
-        sim = self.radius_head * torch.einsum("bhid,bhjd->bhij", queries, keys)
+        if self.qk_norm:
+            queries, keys = map(lambda t: F.normalize(t, dim=-1), (queries, keys))
+            scale = self.attn_temperature
+        else:
+            scale = self.attn_temperature / self.dim_head
+        if self.rope:
+            cos, sin = self.rotary(x.shape[-2], x.device, x.dtype)
+            queries, keys = (self.apply_rotary(t, cos, sin) for t in (queries, keys))
+        sim = scale * torch.einsum("bhid,bhjd->bhij", queries, keys)
         if mask is not None:
             sim = sim.masked_fill(~rearrange(mask, "b j -> b 1 1 j"), -torch.finfo(sim.dtype).max)
         if self.causal:
@@ -185,10 +278,17 @@ class SpinModelTransformerModule(nn.Module):
         The previous iterate is kept because the delayed correlations that feed
         the entropy production need two consecutive fields; at a fixed point the
         two coincide, which is exactly the steady-state expression.
+
+        The fixed-point branch solves without grad and then re-attaches an
+        exact implicit gradient.  Backpropagating through the solver would store
+        every iterate and differentiate the path rather than the solution, and
+        Anderson's ring buffer is written in place besides.
         """
         step_fn = partial(mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta)
         if self.num_steps is None:
-            settled = mf.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
+            with torch.no_grad():
+                solved = mf.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
+            settled = mf.implicit_grad(step_fn, solved, max_iter=self.max_iter)
             return settled, settled
         trajectory = mf.relax_large_d(
             start, drive, couplings, self.beta, num_steps=self.num_steps

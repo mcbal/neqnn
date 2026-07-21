@@ -178,6 +178,51 @@ def anderson(
     return to_state(images[:, slot])
 
 
+def implicit_grad(step_fn, solved: Tensor, *, max_iter: int = 40, tol: float = 1e-7) -> Tensor:
+    """Re-attach an exact gradient to a fixed point that was solved without one.
+
+    At a fixed point ``z = f(z)`` the sensitivity is not the sensitivity of the
+    solver: differentiating through the iterates would store every one of them,
+    and answer a question about the path rather than about the solution.  The
+    implicit function theorem gives it directly -- with ``u = dL/dz``, the
+    quantity that must be propagated into ``f``'s parameters is
+
+        adjoint = u (I - df/dz)^-1,
+
+    which is itself the fixed point of ``a <- u + a df/dz`` and so can be found
+    with vector-Jacobian products alone, no Jacobian ever formed.  One extra
+    evaluation of ``f`` carries it into the parameters.
+
+    Costs O(1) memory in the number of solver steps, and is exact rather than
+    the one-step approximation it replaces.
+    """
+    if not torch.is_grad_enabled():
+        return solved
+
+    # Two evaluations, deliberately.  ``output`` is the one on the real graph and
+    # carries the gradient into the parameters.  ``image`` hangs off a detached
+    # leaf and exists only to supply vector-Jacobian products.  Keeping them
+    # separate is what stops the hook from re-entering itself: differentiating
+    # the tensor the hook is attached to would fire the hook again, and recurse
+    # until memory runs out.
+    output = step_fn(solved.detach())
+    point = solved.detach().requires_grad_(True)
+    image = step_fn(point)
+
+    def backward(grad: Tensor) -> Tensor:
+        adjoint = grad
+        for _ in range(max_iter):
+            update = grad + torch.autograd.grad(image, point, adjoint, retain_graph=True)[0]
+            converged = (update - adjoint).norm() <= tol * update.norm().clamp_min(tol)
+            adjoint = update
+            if converged:
+                break
+        return adjoint
+
+    output.register_hook(backward)
+    return output
+
+
 def contraction_factor(couplings: Tensor, beta: float, dim: int) -> float:
     """Lipschitz bound rho = beta (R^2/D) max_i sum_j |J_ij| on the exact map.
 
