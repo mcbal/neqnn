@@ -20,6 +20,8 @@ between the two approximations and is a controlled limit of neither.
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 from einops import einsum, rearrange
 from torch import Tensor
@@ -193,8 +195,19 @@ def implicit_grad(step_fn, solved: Tensor, *, max_iter: int = 40, tol: float = 1
     with vector-Jacobian products alone, no Jacobian ever formed.  One extra
     evaluation of ``f`` carries it into the parameters.
 
+    The adjoint problem is *linear*, so the same Anderson solver that finds the
+    forward fixed point accelerates it, one vector-Jacobian product per
+    evaluation.  That matters because the adjoint series converges only under
+    the same contraction that controls the forward map: as rho -> 1 both expire
+    together, and a truncated adjoint is a silently wrong gradient.  So the
+    residual is checked after the solve and a warning raised when it is not
+    met -- the gradient counterpart of never reporting a branch count without a
+    residual beside it.
+
     Costs O(1) memory in the number of solver steps, and is exact rather than
-    the one-step approximation it replaces.
+    the one-step approximation it replaces.  Double backward is not supported:
+    the adjoint is computed outside the graph, so grad-of-grad through this
+    fixed point would be silently wrong -- fail loudly if that is ever needed.
     """
     if not torch.is_grad_enabled():
         return solved
@@ -210,13 +223,19 @@ def implicit_grad(step_fn, solved: Tensor, *, max_iter: int = 40, tol: float = 1
     image = step_fn(point)
 
     def backward(grad: Tensor) -> Tensor:
-        adjoint = grad
-        for _ in range(max_iter):
-            update = grad + torch.autograd.grad(image, point, adjoint, retain_graph=True)[0]
-            converged = (update - adjoint).norm() <= tol * update.norm().clamp_min(tol)
-            adjoint = update
-            if converged:
-                break
+        def adjoint_step(a: Tensor) -> Tensor:
+            return grad + torch.autograd.grad(image, point, a, retain_graph=True)[0]
+
+        scale = float(grad.norm().clamp_min(vmf.TINY))
+        adjoint = anderson(adjoint_step, grad, max_iter=max_iter, tol=tol * scale)
+        residual = float((adjoint_step(adjoint) - adjoint).norm()) / scale
+        if residual > tol:
+            warnings.warn(
+                f"implicit gradient adjoint residual {residual:.2e} > tol {tol:.2e}; "
+                "the fixed-point map is likely not contracting (rho too close to 1) "
+                "and this gradient is untrustworthy",
+                stacklevel=2,
+            )
         return adjoint
 
     output.register_hook(backward)
