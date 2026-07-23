@@ -23,15 +23,6 @@ dependencies = [
     "matplotlib>=3.10.0",
     "numpy>=2.4.2",
     "torch>=2.10.0",
-    "tqdm>=4.67.3",
-]
-
-[project.optional-dependencies]
-audio = [
-    "sounddevice>=0.5.5",
-]
-video = [
-    "opencv-python>=4.13.0.92",
 ]
 
 [tool.hatch.metadata]
