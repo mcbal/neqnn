@@ -105,6 +105,7 @@ class SpinModelTransformerModule(nn.Module):
         tol: float = 1e-5,
         ffn: bool = True,
         qk_norm: bool = True,
+        qk_bias: bool = False,
         rope: bool = False,
         rope_base: float = 10_000.0,
         pre_mix: bool = False,
@@ -114,6 +115,8 @@ class SpinModelTransformerModule(nn.Module):
         super().__init__()
         if dim % num_heads:
             raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
+        if num_steps is not None and num_steps < 1:
+            raise ValueError(f"num_steps must be a positive int or None, got {num_steps}")
 
         self.dim = dim
         self.dim_head = dim // num_heads
@@ -134,15 +137,21 @@ class SpinModelTransformerModule(nn.Module):
         self.split_heads = Rearrange("b n (h d) -> b h n d", h=num_heads)
         self.merge_heads = Rearrange("b h n d -> b n (h d)")
 
-        self.to_qk = nn.Linear(dim, 2 * dim, bias=False)
+        # ``qk_bias`` adds a content-independent component to queries and keys.
+        # With zero-mean embeddings and no bias, rope has no constant vector to
+        # rotate, so *positional-only* attention lobes are unrepresentable and
+        # single-layer induction measurably fails to form; the bias restores
+        # that pathway (experiments README, single-pass induction result).
+        self.to_qk = nn.Linear(dim, 2 * dim, bias=qk_bias)
         self.to_v = nn.Linear(dim, dim, bias=False)
 
-        # Ordinary RMS norm, with the physics living entirely in the init: a
-        # uniform gain of R / sqrt(dim_head) makes every drive start with norm
-        # exactly R.  RMS rather than layer norm because subtracting the mean
-        # would remove the component along the all-ones vector, an arbitrary
-        # coordinate axis with no meaning for spins on a sphere.  The affine is
-        # what lets norms later differ per token, as they do in a transformer.
+        # Ordinary RMS norm for the learned branches, with the physics living
+        # entirely in the init: a uniform gain of R / sqrt(dim_head) gives each
+        # normalized head norm exactly R.  As in PaLM's parallel block, the
+        # direct input drive bypasses this norm while Q/K/V and the FFN consume
+        # the normalized stream.  RMS rather than layer norm because subtracting
+        # the mean would remove the component along the all-ones vector, an
+        # arbitrary coordinate axis with no meaning for spins on a sphere.
         self.drive_norm = nn.RMSNorm(self.dim_head, elementwise_affine=True)
         nn.init.constant_(self.drive_norm.weight, self.radius_head / self.dim_head**0.5)
 
@@ -154,8 +163,8 @@ class SpinModelTransformerModule(nn.Module):
         self.attn_temperature = nn.Parameter(torch.tensor(float(self.dim_head) ** 0.5))
 
         # Disabling drops the memory term from the drive entirely.  It cannot be
-        # an nn.Identity: the drive is ``x + f_FFN(x)``, so an identity would
-        # double the input rather than remove the term.
+        # an nn.Identity: the drive is ``x + f_FFN(norm(x))``, so an identity
+        # would add the normalized stream rather than remove the term.
         self.ffn = (
             nn.Sequential(
                 nn.Linear(dim, 4 * dim, bias=False),
@@ -177,7 +186,7 @@ class SpinModelTransformerModule(nn.Module):
     #
 
     def normalize(self, x: Tensor) -> Tensor:
-        """Fix the scale of each head's slice of the drive.
+        """Normalize the input stream for Q/K/V and the FFN.
 
         R is the radius the *microscopic spins* live on, and magnetizations are
         bounded by it by construction.  The drive is under no such obligation.
@@ -213,17 +222,23 @@ class SpinModelTransformerModule(nn.Module):
         even, odd = t[..., 0::2], t[..., 1::2]
         return torch.stack([even * cos - odd * sin, even * sin + odd * cos], dim=-1).flatten(-2)
 
-    def drive_and_couplings(self, x: Tensor, mask: Tensor | None) -> tuple[Tensor, Tensor]:
-        """The frozen-drive field ``x + f_FFN(x)`` and the coupling rule J(X_t).
+    def drive_and_couplings(
+        self, x: Tensor, mask: Tensor | None, *, normalized: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """The field ``x + f_FFN(norm(x))`` and coupling rule ``J(norm(x))``.
 
         With ``qk_norm`` the logit is ``R_head cos(q, k)``, bounded by the head
         radius whatever the weights do -- stable, but it also means query and key
         *magnitude* carries no information and the usual lever on attention
         sharpness is disconnected.  Without it the logit is the plain scaled dot
         product, so norms are free to grow and sharpen the couplings.
+
+        ``normalized`` lets forward paths reuse their normalized input for the
+        amortized V initialization.  Diagnostic callers can omit it.
         """
-        queries, keys = self.to_qk(x).chunk(2, dim=-1)
-        drive = self.split_heads(x if self.ffn is None else x + self.ffn(x))
+        normalized = self.normalize(x) if normalized is None else normalized
+        queries, keys = self.to_qk(normalized).chunk(2, dim=-1)
+        drive = self.split_heads(x if self.ffn is None else x + self.ffn(normalized))
         queries, keys = map(self.split_heads, (queries, keys))
 
         if self.qk_norm:
@@ -298,9 +313,9 @@ class SpinModelTransformerModule(nn.Module):
     def forward(
         self, x: Tensor, state: MeanFieldState | None = None, mask: Tensor | None = None
     ) -> Readout:
-        x = self.normalize(x)
-        drive, couplings = self.drive_and_couplings(x, mask)
-        settled, previous = self.settle(self.initial(x, state), drive, couplings)
+        normalized = self.normalize(x)
+        drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
+        settled, previous = self.settle(self.initial(normalized, state), drive, couplings)
 
         entropy_production = None
         if self.measure_entropy_production:
@@ -335,9 +350,9 @@ class SpinModelTransformerModule(nn.Module):
         separately, so this reports the approach to the steady state even when
         the module itself runs at finite K and never computes one.
         """
-        x = self.normalize(x)
-        drive, couplings = self.drive_and_couplings(x, mask)
-        start = self.initial(x, state)
+        normalized = self.normalize(x)
+        drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
+        start = self.initial(normalized, state)
 
         trajectory = mf.relax_large_d(start, drive, couplings, self.beta, num_steps=num_steps)
         step_fn = partial(mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta)
