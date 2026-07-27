@@ -1,1 +1,32 @@
 # neqnn
+
+Nonequilibrium dynamics in spin-model transformers — companion code for
+[this post](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
+
+A transformer block whose forward pass *is* the relaxation of a vector-spin
+system. Spins live on a sphere of radius `R`, softmax attention supplies the
+coupling rule `J(X_t)`, and the layer iterates the mean-field magnetization
+recurrence
+
+    m_{k+1} = phi(x + f_FFN(x) + J(X_t) m_k)
+
+on three separated timescales: `k` for internal relaxation, `t` for the drive,
+`n` for learning.
+
+```python
+import torch
+from neqnn import SpinModelTransformerModule
+
+module = SpinModelTransformerModule(
+    dim=256, num_heads=1,
+    num_steps=4,        # int -> finite horizon;  None -> fixed point
+    init="carried",     # "reset" | "amortized" | "carried"
+    beta=2.0, rope=True,
+    measure_entropy_production=True,
+)
+
+out = module(torch.randn(1, 32, 256))
+out.magnetizations       # (1, 32, 256)
+out.state                # feed to the next drive step
+out.entropy_production   # housekeeping cost of the steady state
+```
