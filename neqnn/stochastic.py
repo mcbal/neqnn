@@ -12,6 +12,8 @@ Seed with ``torch.manual_seed``; no generator is threaded through.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 from einops import einsum
 from torch import Tensor
@@ -48,6 +50,12 @@ def simulate(
 
     Chains are independent replicates, so pooling over both axes is legitimate
     for stationary estimates while the chain axis still exposes seed spread.
+
+    Holds the whole trajectory, so it costs ``T C N D`` numbers -- fine when the
+    path itself is wanted (plots, autocorrelations, D=3 visualizations) and
+    hopeless at the sizes the first experiment runs: N=128, D=512, 64 chains,
+    4000 steps is 125 GiB.  Use ``estimate`` for stationary averages, which
+    streams the same chains and keeps only the accumulators.
     """
     sites, dim = drive.shape[-2:]
     kwargs = dict(dtype=drive.dtype, device=drive.device)
@@ -59,6 +67,75 @@ def simulate(
         state = step(state, drive, couplings, beta)
         states[index] = state
     return states
+
+
+class Estimates(NamedTuple):
+    """Stationary estimates pooled over chains and time, matching the estimators below."""
+
+    magnetizations: Tensor  # (N, D)
+    covariances: Tensor  # (N, D, D)
+    delayed_correlations: Tensor  # (N, N)
+    standard_error: Tensor  # (N,)
+
+
+def estimate(
+    drive: Tensor,
+    couplings: Tensor,
+    beta: float,
+    *,
+    num_chains: int,
+    num_steps: int,
+    burn_in: int,
+) -> Estimates:
+    """Same chains as ``simulate``, but accumulated instead of stored.
+
+    Every stationary estimator we need is a sum over ``(t, c)`` of something
+    local in time -- first moment, second moment, and the one-step-lagged
+    product -- so none of them requires the trajectory to be kept.  Memory drops
+    from ``T C N D`` to ``N D^2``, which at N=128, D=512 is 256 MiB regardless
+    of how long the chains run, and the run length becomes purely a time budget.
+
+    The connected quantities are formed at the end from the raw moments.  That
+    is the numerically weaker order of operations than centering first, but the
+    alternative needs a mean that is not known until the run is over, and in
+    float64 at these magnitudes the cancellation costs a few digits out of
+    fifteen -- far below Monte Carlo error.
+    """
+    sites, dim = drive.shape[-2:]
+    kwargs = dict(dtype=drive.dtype, device=drive.device)
+    state = random_state((num_chains, sites), dim, **kwargs)
+    for _ in range(burn_in):
+        state = step(state, drive, couplings, beta)
+
+    total = torch.zeros(sites, dim, **kwargs)
+    second = torch.zeros(sites, dim, dim, **kwargs)
+    lagged = torch.zeros(sites, sites, **kwargs)
+    chain_total = torch.zeros(num_chains, sites, dim, **kwargs)
+
+    for index in range(num_steps):
+        previous, state = state, step(state, drive, couplings, beta)
+        total += state.sum(0)
+        chain_total += state
+        second += einsum(state, state, "c n d, c n e -> n d e")
+        if index:
+            lagged += einsum(state, previous, "c i d, c j d -> i j")
+
+    count = num_steps * num_chains
+    magnetizations = total / count
+    covariances = second / count - einsum(
+        magnetizations, magnetizations, "n d, n e -> n d e"
+    )
+    delayed = lagged / ((num_steps - 1) * num_chains) - einsum(
+        magnetizations, magnetizations, "i d, j d -> i j"
+    )
+    chain_means = chain_total / num_steps
+    return Estimates(
+        magnetizations=magnetizations,
+        covariances=covariances,
+        delayed_correlations=delayed,
+        standard_error=chain_means.std(0, correction=1).norm(dim=-1)
+        / num_chains**0.5,
+    )
 
 
 def transition_logp(
@@ -92,11 +169,20 @@ def covariances(states: Tensor) -> Tensor:
 
 
 def delayed_correlations(states: Tensor) -> Tensor:
-    """Connected delayed correlations Tr <s_{i,t+1} s_{j,t}^T>_c, shape (N, N)."""
+    """Connected delayed correlations Tr <s_{i,t+1} s_{j,t}^T>_c, shape (N, N).
+
+    Written as ``<a b> - <a><b>`` rather than by centering each leg first.  The
+    two differ here, unlike for the single-time covariance: there are only T-1
+    lagged pairs against T states, so centering on the pooled mean leaves a
+    residual O(1/T) that the raw-moment form does not have.  It also makes this
+    agree with ``estimate`` to machine precision, which is what lets the cheap
+    streaming path be checked against the explicit one.
+    """
     mean = states.flatten(0, 1).mean(0)
-    later = states[1:].flatten(0, 1) - mean
-    earlier = states[:-1].flatten(0, 1) - mean
-    return einsum(later, earlier, "t i d, t j d -> i j") / later.shape[0]
+    later, earlier = states[1:].flatten(0, 1), states[:-1].flatten(0, 1)
+    return einsum(later, earlier, "t i d, t j d -> i j") / later.shape[0] - einsum(
+        mean, mean, "i d, j d -> i j"
+    )
 
 
 def standard_error(states: Tensor) -> Tensor:

@@ -15,13 +15,12 @@ D=3-ish where the vectors can simply be plotted.
 
 from __future__ import annotations
 
-import warnings
-
 import torch
 from einops import einsum, rearrange
 from torch import Tensor
 
 from neqnn import vmf
+from neqnn.fixed_point import residual
 
 #
 # Magnetizations

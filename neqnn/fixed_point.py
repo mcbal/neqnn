@@ -1,9 +1,19 @@
+"""Solving ``m = f(m)``, and differentiating the solution.
+
+Nothing here knows about spins.  ``anderson`` accelerates the search for a fixed
+point of any map on ``(..., N, D)`` and ``implicit_grad`` re-attaches the exact
+gradient afterwards, so the same two functions serve the forward relaxation and
+the linear adjoint problem in the backward pass.
+
+The trajectory of the physical relaxation is a different object and lives in
+``mean_field.relax*``; the iterates here are solver states with no k attached.
+"""
+
 from __future__ import annotations
 
 import warnings
 
 import torch
-from einops import einsum, rearrange
 from torch import Tensor
 
 

@@ -39,7 +39,7 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch import Tensor, nn
 
-from neqnn import mean_field as mf, proxies, vmf
+from neqnn import fixed_point as fp, mean_field as mf, proxies, vmf
 
 
 class MeanFieldState(NamedTuple):
@@ -307,10 +307,10 @@ class SpinModelTransformerModule(nn.Module):
         )
         if self.num_steps is None:
             with torch.no_grad():
-                solved = mf.anderson(
+                solved = fp.anderson(
                     step_fn, start, max_iter=self.max_iter, tol=self.tol
                 )
-            settled = mf.implicit_grad(step_fn, solved, max_iter=self.max_iter)
+            settled = fp.implicit_grad(step_fn, solved, max_iter=self.max_iter)
             return settled, settled
         trajectory = mf.relax_large_d(
             start, drive, couplings, self.beta, num_steps=self.num_steps
@@ -372,7 +372,7 @@ class SpinModelTransformerModule(nn.Module):
         step_fn = partial(
             mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta
         )
-        steady = mf.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
+        steady = fp.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
 
         fields = mf.effective_field(trajectory, drive, couplings)
         steady_field = mf.effective_field(steady, drive, couplings)

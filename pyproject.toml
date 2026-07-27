@@ -25,6 +25,12 @@ dependencies = [
     "torch>=2.10.0",
 ]
 
+[dependency-groups]
+# scipy is a test-only reference for the Bessel and normalizer routines, never
+# imported by the package itself -- which is the point, since it underflows
+# exactly where our recurrence has to keep working.
+dev = ["pytest>=8.0", "scipy>=1.14"]
+
 [tool.hatch.metadata]
 allow-direct-references = true
 

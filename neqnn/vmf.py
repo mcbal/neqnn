@@ -160,7 +160,7 @@ def _covariance_from_variances(
 ) -> Tensor:
     dim = field.shape[-1]
     direction = field / field.norm(dim=-1, keepdim=True).clamp_min(
-        torch.finfo(effective_field.dtype).tiny
+        torch.finfo(field.dtype).tiny
     )
     eye = torch.eye(dim, dtype=field.dtype, device=field.device)
     outer = direction.unsqueeze(-1) * direction.unsqueeze(-2)
