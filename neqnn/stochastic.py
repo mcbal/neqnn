@@ -70,12 +70,23 @@ def simulate(
 
 
 class Estimates(NamedTuple):
-    """Stationary estimates pooled over chains and time, matching the estimators below."""
+    """Stationary estimates pooled over chains and time, matching the estimators below.
+
+    ``chain_magnetizations`` is the per-chain magnetization *magnitude*, averaged
+    over chains, against which ``magnetizations`` is the pooled vector average.
+    The two agree when the chain is ergodic and separate sharply when it is not:
+    at strong coupling and weak drive every chain magnetizes to nearly the same
+    magnitude but in its own arbitrary direction, so the pooled average collapses
+    while the per-chain magnitude does not.  Comparing mean field against the
+    pooled average there compares an ordered state to an average over rotations,
+    which is a different question from how good the approximation is.
+    """
 
     magnetizations: Tensor  # (N, D)
     covariances: Tensor  # (N, D, D)
     delayed_correlations: Tensor  # (N, N)
     standard_error: Tensor  # (N,)
+    chain_magnetizations: Tensor  # (N,)
 
 
 def estimate(
@@ -135,6 +146,7 @@ def estimate(
         delayed_correlations=delayed,
         standard_error=chain_means.std(0, correction=1).norm(dim=-1)
         / num_chains**0.5,
+        chain_magnetizations=chain_means.norm(dim=-1).mean(0),
     )
 
 

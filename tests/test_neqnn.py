@@ -334,6 +334,80 @@ def test_housekeeping_entropy_production_vanishes_for_symmetric_couplings():
     assert float(proxies.housekeeping_entropy_production(couplings, asymmetric_traces, beta)) > 0
 
 
+def test_housekeeping_is_the_mean_field_substitution_into_the_exact_relation():
+    """sigma_hk is entropy_production fed the mean-field delayed correlations."""
+    dim, beta = 64, 1.0
+    drive, couplings = random_problem(dim)
+    field = mf.effective_field(torch.zeros_like(drive), drive, couplings)
+    traces = mf.covariance_traces_large_d(field, field, beta)
+    assert torch.allclose(
+        proxies.entropy_production(couplings, beta * couplings * traces, beta),
+        proxies.housekeeping_entropy_production(couplings, traces, beta),
+        rtol=1e-12,
+    )
+
+
+def test_entropy_production_matches_the_path_log_ratio_of_the_chain():
+    """The exact relation must reproduce <log P(s'|s) - log P(s|s')> on the chain.
+
+    This is the only fully independent check on the entropy production: one side
+    is a correlation function, the other is the definition of irreversibility.
+    """
+    dim, sites, beta = 32, 16, 1.0
+    drive, couplings = random_problem(dim, sites)
+    chains, steps = 32, 200
+
+    torch.manual_seed(5)
+    state = stochastic.random_state((chains, sites), dim)
+    for _ in range(100):
+        state = stochastic.step(state, drive, couplings, beta)
+
+    total = torch.zeros(sites, dim)
+    lagged = torch.zeros(sites, sites)
+    log_ratio = 0.0
+    for index in range(steps):
+        previous, state = state, stochastic.step(state, drive, couplings, beta)
+        total += state.sum(0)
+        if index:
+            lagged += torch.einsum("cid,cjd->ij", state, previous)
+            log_ratio += float(
+                (
+                    stochastic.transition_logp(state, previous, drive, couplings, beta)
+                    - stochastic.transition_logp(
+                        previous, state, drive, couplings, beta
+                    )
+                ).sum()
+            )
+
+    magnetizations = total / (steps * chains)
+    delayed = lagged / ((steps - 1) * chains) - torch.einsum(
+        "id,jd->ij", magnetizations, magnetizations
+    )
+    from_correlations = float(proxies.entropy_production(couplings, delayed, beta))
+    from_paths = log_ratio / ((steps - 1) * chains)
+
+    assert from_correlations > 0
+    assert abs(from_correlations - from_paths) < 0.05 * from_paths
+
+
+def test_entropy_production_only_sees_the_antisymmetric_part():
+    """A symmetric perturbation of the delayed correlations must not move sigma.
+
+    This is why sigma_hk stays accurate in a regime where the delayed
+    correlations themselves are badly wrong: the mean-field error is mostly
+    symmetric, and sigma is blind to that subspace by construction.
+    """
+    dim, beta = 32, 1.0
+    _, couplings = random_problem(dim)
+    delayed = torch.randn(8, 8)
+    symmetric = torch.randn(8, 8)
+    symmetric = symmetric + symmetric.T
+    assert torch.allclose(
+        proxies.entropy_production(couplings, delayed + symmetric, beta),
+        proxies.entropy_production(couplings, delayed, beta),
+    )
+
+
 def test_mismatch_vanishes_at_the_fixed_point_and_is_positive_away_from_it():
     dim, beta = 64, 1.0
     drive, couplings = random_problem(dim)

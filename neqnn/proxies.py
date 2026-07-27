@@ -37,10 +37,37 @@ from torch import Tensor
 from neqnn import vmf
 
 
+def entropy_production(couplings: Tensor, delayed: Tensor, beta: float) -> Tensor:
+    """sigma = beta sum_ij (J_ij - J_ji) C^del_ij, the exact steady-state rate.
+
+    This is what ``housekeeping_entropy_production`` approximates, and the honest
+    reference to measure it against.  It follows from the log-ratio of forward
+    and backward transitions: the normalizers and the drive term both average to
+    zero in the steady state, leaving a quantity linear in the delayed
+    correlations and weighted by the *antisymmetric* part of the couplings.
+
+    Two consequences worth keeping in mind.  It costs nothing beyond delayed
+    correlations that have already been accumulated, so there is never a reason
+    to plug sampled covariances into the mean-field formula instead.  And
+    because the weight is antisymmetric while ``C*_ij`` is symmetric, sigma sees
+    only the antisymmetric part of ``C^del`` -- any error in the symmetric part
+    is invisible to it, which is exactly why sigma_hk survives a regime where
+    the delayed correlations themselves are badly wrong.
+    """
+    asymmetry = couplings - couplings.transpose(-1, -2)
+    return beta * (asymmetry * delayed).sum((-2, -1))
+
+
 def housekeeping_entropy_production(
     couplings: Tensor, covariance_traces: Tensor, beta: float
 ) -> Tensor:
     """sigma_hk = (beta^2/2) sum_ij (J_ij - J_ji)^2 C*_ij.
+
+    Substituting the mean-field ``C^del_ij = beta J_ij C*_ij`` into
+    ``entropy_production`` and antisymmetrizing -- legitimate because ``C*`` is
+    symmetric -- turns ``sum (J_ij - J_ji) J_ij C*_ij`` into
+    ``(1/2) sum (J_ij - J_ji)^2 C*_ij``.  The two are the same quantity computed
+    from different inputs, so they agree exactly when handed consistent ones.
 
     The irreversibility the system keeps paying once it has settled, carried
     entirely by the asymmetric part of the coupling rule. It does not relax
