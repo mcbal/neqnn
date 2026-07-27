@@ -23,11 +23,21 @@ import torch
 from torch import Tensor
 
 
-def radius(dim: int) -> float:
-    """Spin radius R, fixed by the convention R^2 = D/2 - 1."""
+def order(dim: int) -> float:
+    """The Bessel order D/2 - 1, which the radius convention makes equal to R^2.
+
+    Every appearance of the convention routes through here, so it lives (and is
+    validated) in exactly one place: at D <= 2 the order is not positive and
+    nothing downstream is defined.
+    """
     if dim <= 2:
         raise ValueError(f"radius convention requires dim > 2, got {dim}")
-    return math.sqrt(dim / 2 - 1)
+    return dim / 2 - 1
+
+
+def radius(dim: int) -> float:
+    """Spin radius R, fixed by the convention R^2 = D/2 - 1."""
+    return math.sqrt(order(dim))
 
 
 def concentration(field: Tensor, beta: float) -> Tensor:
@@ -37,7 +47,7 @@ def concentration(field: Tensor, beta: float) -> Tensor:
 
 def gamma(field: Tensor, beta: float) -> Tensor:
     """Local stiffness gamma = sqrt(1 + beta^2 ||h||^2 / R^2), keeping the vector axis."""
-    r2 = field.shape[-1] / 2 - 1
+    r2 = order(field.shape[-1])
     return torch.sqrt(1 + beta**2 * field.pow(2).sum(-1, keepdim=True) / r2)
 
 
@@ -77,12 +87,12 @@ def bessel_ratio(x: Tensor, order: float, num_iter: int = 64) -> Tensor:
 
 def mean_resultant(kappa: Tensor, dim: int) -> Tensor:
     """A_D(kappa) = I_{D/2}(kappa) / I_{D/2-1}(kappa) = E[mu . u]."""
-    return bessel_ratio(kappa, dim / 2 - 1)
+    return bessel_ratio(kappa, order(dim))
 
 
 def mean_resultant_large_d(kappa: Tensor, dim: int) -> Tensor:
     """Large-D form of A_D, obtained by dropping O(1) terms in the Amos estimate."""
-    r2 = dim / 2 - 1
+    r2 = order(dim)
     return kappa / (r2 * (1 + torch.sqrt(1 + (kappa / r2) ** 2)))
 
 
@@ -130,7 +140,7 @@ def variances(field: Tensor, beta: float) -> tuple[Tensor, Tensor]:
     variance along it.
     """
     dim = field.shape[-1]
-    r2 = dim / 2 - 1
+    r2 = order(dim)
     kappa = concentration(field, beta)
     resultant = mean_resultant(kappa, dim)
     # A_D(kappa) / kappa -> 1/D as kappa -> 0.
@@ -205,7 +215,7 @@ def kl_large_d(field_p: Tensor, field_q: Tensor, beta: float) -> Tensor:
     state it penalizes both norm and angular departure of ``p`` from it, and
     vanishes exactly at convergence.
     """
-    r2 = field_p.shape[-1] / 2 - 1
+    r2 = order(field_p.shape[-1])
     m_p, m_q = response_large_d(field_p, beta), response_large_d(field_q, beta)
     norm_p, norm_q = m_p.pow(2).sum(-1), m_q.pow(2).sum(-1)
     slack = r2 - norm_q

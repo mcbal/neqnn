@@ -117,7 +117,7 @@ def contraction_factor(couplings: Tensor, beta: float, dim: int) -> float:
     The exact response has gain ``beta R^2 A_D'(0) = beta (D/2 - 1)/D``, attained
     at h=0 since A_D is concave.
     """
-    return beta * (dim / 2 - 1) / dim * float(couplings.abs().sum(-1).max())
+    return beta * vmf.order(dim) / dim * float(couplings.abs().sum(-1).max())
 
 
 def contraction_factor_large_d(couplings: Tensor, beta: float) -> float:
@@ -171,7 +171,7 @@ def _covariance_parts_large_d(
     field: Tensor, beta: float
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Write the large-D covariance as ``Sigma = a I - b m m^T``."""
-    r2 = field.shape[-1] / 2 - 1
+    r2 = vmf.order(field.shape[-1])
     stiffness = vmf.gamma(field, beta).squeeze(-1)
     return 1 / (1 + stiffness), 1 / (r2 * stiffness), vmf.response_large_d(field, beta)
 

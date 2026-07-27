@@ -1,9 +1,12 @@
-"""Solving ``m = f(m)``, and differentiating the solution.
+"""Solving ``m = f(m)``, diagnosing the solution, and differentiating it.
 
 Nothing here knows about spins.  ``anderson`` accelerates the search for a fixed
 point of any map on ``(..., N, D)`` and ``implicit_grad`` re-attaches the exact
 gradient afterwards, so the same two functions serve the forward relaxation and
-the linear adjoint problem in the backward pass.
+the linear adjoint problem in the backward pass.  ``local_contraction`` and
+``distinct_fixed_points`` are the evidence that belongs beside every reported
+fixed point: a converged residual alone says nothing about whether the point is
+attracting or unique.
 
 The trajectory of the physical relaxation is a different object and lives in
 ``mean_field.relax*``; the iterates here are solver states with no k attached.
@@ -12,6 +15,7 @@ The trajectory of the physical relaxation is a different object and lives in
 from __future__ import annotations
 
 import warnings
+from typing import Iterable, NamedTuple
 
 import torch
 from torch import Tensor
@@ -22,6 +26,21 @@ def residual(magnetizations: Tensor, previous: Tensor) -> float:
     return float((magnetizations - previous).norm(dim=-1).max())
 
 
+class Solve(NamedTuple):
+    """A fixed point together with the evidence for it.
+
+    ``residual`` is the worst-site update at the last accepted iterate; the
+    returned ``solution`` is that iterate's image, so its true residual is
+    smaller still wherever the map contracts.  Returning the evidence with the
+    point is deliberate: a solution reported without its residual invites
+    exactly the mistake of trusting an unconverged solve.
+    """
+
+    solution: Tensor
+    residual: float
+    converged: bool
+
+
 def anderson(
     step_fn,
     initial: Tensor,
@@ -29,9 +48,8 @@ def anderson(
     max_iter: int = 40,
     tol: float = 1e-5,
     memory: int = 5,
-    damping: float = 1.0,
     ridge: float = 1e-6,
-) -> Tensor:
+) -> Solve:
     """Anderson-accelerated solve of ``m = step_fn(m)``, for ``initial`` of (..., N, D).
 
     Rather than taking the raw update, mix the last ``memory`` iterates with the
@@ -46,7 +64,8 @@ def anderson(
     Which fixed point is reached still depends on ``initial`` wherever more than
     one exists, so this does not paper over basin structure.
 
-    Leading axes are independent problems, solved in parallel.
+    Leading axes are independent problems, solved in parallel; the residual and
+    the convergence flag are taken over the worst of them.
     """
     sites, dim = initial.shape[-2:]
     batch_shape = initial.shape[:-2]
@@ -69,12 +88,14 @@ def anderson(
     system[:, 1:, 0] = 1.0
     target[:, 0] = 1.0
 
+    gap = lambda slot: float((images[:, slot] - iterates[:, slot]).norm(dim=-1).max())
+
     slot = 1
     for step in range(2, max_iter):
         # Tested before the solve, not after: on an already-converged problem
         # every gap is zero, the Gram matrix is singular, and the bordered
         # system has no unique solution.  An all-zero drive does exactly that.
-        if (images[:, slot] - iterates[:, slot]).norm(dim=-1).max() < tol:
+        if gap(slot) < tol:
             break
 
         window = min(step, memory)
@@ -88,12 +109,10 @@ def anderson(
         )[:, 1:, 0].unsqueeze(1)
 
         slot = step % memory
-        iterates[:, slot] = (
-            damping * (weights @ images[:, :window])[:, 0]
-            + (1 - damping) * (weights @ iterates[:, :window])[:, 0]
-        )
+        iterates[:, slot] = (weights @ images[:, :window])[:, 0]
         images[:, slot] = to_flat(step_fn(to_state(iterates[:, slot])))
-    return to_state(images[:, slot])
+    final = gap(slot)
+    return Solve(to_state(images[:, slot]), final, final < tol)
 
 
 def implicit_grad(
@@ -117,10 +136,10 @@ def implicit_grad(
     forward fixed point accelerates it, one vector-Jacobian product per
     evaluation.  That matters because the adjoint series converges only under
     the same contraction that controls the forward map: as rho -> 1 both expire
-    together, and a truncated adjoint is a silently wrong gradient.  So the
-    residual is checked after the solve and a warning raised when it is not
-    met -- the gradient counterpart of never reporting a branch count without a
-    residual beside it.
+    together, and a truncated adjoint is a silently wrong gradient.  So a
+    warning is raised whenever the adjoint solve reports non-convergence -- the
+    gradient counterpart of never reporting a branch count without a residual
+    beside it.
 
     Costs O(1) memory in the number of solver steps, and is exact rather than
     the one-step approximation it replaces.  Double backward is not supported:
@@ -147,16 +166,75 @@ def implicit_grad(
             return grad + torch.autograd.grad(image, point, a, retain_graph=True)[0]
 
         scale = float(grad.norm().clamp_min(tiny))
-        adjoint = anderson(adjoint_step, grad, max_iter=max_iter, tol=tol * scale)
-        residual = float((adjoint_step(adjoint) - adjoint).norm()) / scale
-        if residual > tol:
+        solve = anderson(adjoint_step, grad, max_iter=max_iter, tol=tol * scale)
+        if not solve.converged:
             warnings.warn(
-                f"implicit gradient adjoint residual {residual:.2e} > tol {tol:.2e}; "
-                "the fixed-point map is likely not contracting (rho too close to 1) "
-                "and this gradient is untrustworthy",
+                f"implicit gradient adjoint residual {solve.residual / scale:.2e} "
+                f"> tol {tol:.2e}; the fixed-point map is likely not contracting "
+                "(rho too close to 1) and this gradient is untrustworthy",
                 stacklevel=2,
             )
-        return adjoint
+        return solve.solution
 
     output.register_hook(backward)
     return output
+
+
+def local_contraction(step_fn, point: Tensor, *, iterations: int = 60) -> float:
+    """Spectral radius of d step_fn/dm at ``point``, by power iteration on VJPs.
+
+    This is the number that actually decides whether the iteration converges:
+    Lipschitz bounds like ``contraction_factor`` are evaluated at h = 0, and the
+    response is concave, so a site sitting in a strong field is far less
+    responsive than the bound allows.
+
+    Meaningful only where ``point`` is genuinely a fixed point.  Measured at an
+    iterate the solver never settled -- residual not at tolerance -- the power
+    iteration rides a wandering point and reports rho ~ 1 regardless of beta,
+    which reads as physics and is not.  Always check the residual first.
+    """
+    point = point.detach().clone().requires_grad_(True)
+    image = step_fn(point)
+    vector = torch.randn_like(point)
+    vector = vector / vector.norm()
+    value = 0.0
+    for _ in range(iterations):
+        product = torch.autograd.grad(image, point, vector, retain_graph=True)[0]
+        value = float(product.norm())
+        vector = product / product.norm().clamp_min(
+            torch.finfo(product.dtype).tiny
+        )
+    return value
+
+
+def distinct_fixed_points(
+    step_fn,
+    starts: Iterable[Tensor],
+    *,
+    max_iter: int = 200,
+    tol: float = 1e-13,
+    residual_tol: float = 1e-8,
+    match_tol: float = 1e-3,
+) -> list[Tensor]:
+    """The distinct converged fixed points reached from the given starts.
+
+    Anderson solves the *root-finding* problem, so it converges to repelling
+    fixed points as happily as attracting ones: every point returned here still
+    needs ``local_contraction`` beside it before it can be called physical.
+    But more than one entry is already a diagnosis -- the map is multistable,
+    and any single-start "error" measured on it is silently a statement about
+    which basin the solver fell into.
+
+    Solutions whose residual misses ``residual_tol`` are dropped rather than
+    counted: an unconverged iterate is not a branch.
+    """
+    found: list[Tensor] = []
+    for start in starts:
+        solve = anderson(step_fn, start, max_iter=max_iter, tol=tol)
+        if solve.residual > residual_tol:
+            continue
+        if not any(
+            float((solve.solution - other).norm()) < match_tol for other in found
+        ):
+            found.append(solve.solution)
+    return found

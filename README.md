@@ -18,10 +18,11 @@ import torch
 from neqnn import SpinModelTransformerModule
 
 module = SpinModelTransformerModule(
-    dim=256, num_heads=1,
-    num_steps=4,        # int -> finite horizon;  None -> fixed point
-    init="carried",     # "reset" | "amortized" | "carried"
-    beta=2.0, rope=True,
+    dim=256,
+    num_heads=4,
+    num_steps=1,          # int -> finite horizon;  None -> fixed point
+    init="amortized",     # "reset" | "amortized" | "carried"
+    rope=True,
     measure_entropy_production=True,
 )
 

@@ -76,10 +76,27 @@ def advance(
     return MeanFieldState(magnetizations=magnetizations)
 
 
+class Probe(NamedTuple):
+    """Raw ingredients of one forward pass, for control-room instrumentation.
+
+    Returned by ``forward(..., probe=True)`` so that diagnostics decompose the
+    *same* pass the module ran, rather than re-implementing the forward outside
+    it and silently drifting when it changes.  Everything is per head, shaped
+    like the carried state; what to measure on these tensors is the
+    instrument's business, not the module's.
+    """
+
+    x: Tensor  # the input stream, split into heads
+    drive: Tensor  # x + f_FFN(norm(x))
+    couplings: Tensor  # J(norm(x)), (b, heads, n, n)
+    initial: Tensor  # M_{t,0}, the initialization the relaxation started from
+
+
 class Readout(NamedTuple):
     magnetizations: Tensor
     state: MeanFieldState
     entropy_production: Tensor | None = None
+    probe: Probe | None = None
 
 
 class Relaxation(NamedTuple):
@@ -170,8 +187,8 @@ class SpinModelTransformerModule(nn.Module):
         self.pre_mix = nn.Linear(dim, dim, bias=False) if pre_mix else nn.Identity()
         self.post_mix = nn.Linear(dim, dim, bias=False) if post_mix else nn.Identity()
 
-        self.register_buffer("causal_mask", None, persistent=False)
-        self.register_buffer("rope_cache", None, persistent=False)
+        self.register_buffer("_causal_mask", None, persistent=False)
+        self.register_buffer("_rope_cache", None, persistent=False)
 
     #
     # Drive-dependent quantities.  These depend on X_t only, so they are shared
@@ -198,8 +215,14 @@ class SpinModelTransformerModule(nn.Module):
         surviving pairs are unchanged.  Absolute site embeddings would break
         that and make carried state describe the wrong tokens.
         """
-        if self.rope_cache is not None and self.rope_cache.shape[-2] >= n:
-            cached = self.rope_cache[..., :n, :]
+        cache = self._rope_cache
+        if (
+            cache is not None
+            and cache.shape[-2] >= n
+            and cache.dtype == dtype
+            and cache.device == device
+        ):
+            cached = cache[..., :n, :]
             return cached[0], cached[1]
         power = (
             torch.arange(0, self.dim_head, 2, device=device, dtype=dtype)
@@ -209,7 +232,7 @@ class SpinModelTransformerModule(nn.Module):
             torch.arange(n, device=device, dtype=dtype), self.rope_base**-power
         )
         self.register_buffer(
-            "rope_cache", torch.stack([angles.cos(), angles.sin()]), persistent=False
+            "_rope_cache", torch.stack([angles.cos(), angles.sin()]), persistent=False
         )
         return angles.cos(), angles.sin()
 
@@ -254,17 +277,17 @@ class SpinModelTransformerModule(nn.Module):
         if self.causal:
             sim = sim.masked_fill(
                 rearrange(
-                    self.get_causal_mask(sim.shape[-1], sim.device), "i j -> 1 1 i j"
+                    self.causal_mask(sim.shape[-1], sim.device), "i j -> 1 1 i j"
                 ),
                 -torch.finfo(sim.dtype).max,
             )
         return drive, sim.softmax(dim=-1)
 
-    def get_causal_mask(self, n: int, device) -> Tensor:
-        if self.causal_mask is not None and self.causal_mask.shape[-1] >= n:
-            return self.causal_mask[:n, :n]
+    def causal_mask(self, n: int, device) -> Tensor:
+        if self._causal_mask is not None and self._causal_mask.shape[-1] >= n:
+            return self._causal_mask[:n, :n]
         mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
-        self.register_buffer("causal_mask", mask, persistent=False)
+        self.register_buffer("_causal_mask", mask, persistent=False)
         return mask
 
     def initial(self, x: Tensor, state: MeanFieldState | None) -> Tensor:
@@ -309,23 +332,27 @@ class SpinModelTransformerModule(nn.Module):
             with torch.no_grad():
                 solved = fp.anderson(
                     step_fn, start, max_iter=self.max_iter, tol=self.tol
-                )
+                ).solution
             settled = fp.implicit_grad(step_fn, solved, max_iter=self.max_iter)
             return settled, settled
-        trajectory = mf.relax_large_d(
-            start, drive, couplings, self.beta, num_steps=self.num_steps
-        )
-        return trajectory[-1], trajectory[-2]
+        previous, current = start, start
+        for _ in range(self.num_steps):
+            previous, current = current, step_fn(current)
+        return current, previous
 
     def forward(
-        self, x: Tensor, state: MeanFieldState | None = None, mask: Tensor | None = None
+        self,
+        x: Tensor,
+        state: MeanFieldState | None = None,
+        mask: Tensor | None = None,
+        *,
+        probe: bool = False,
     ) -> Readout:
         x = self.pre_mix(x)
         normalized = self.normalize(x)
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
-        settled, previous = self.settle(
-            self.initial(normalized, state), drive, couplings
-        )
+        initial = self.initial(normalized, state)
+        settled, previous = self.settle(initial, drive, couplings)
 
         entropy_production = None
         if self.measure_entropy_production:
@@ -343,6 +370,11 @@ class SpinModelTransformerModule(nn.Module):
             magnetizations=self.post_mix(self.merge_heads(settled)),
             state=MeanFieldState(magnetizations=settled),
             entropy_production=entropy_production,
+            probe=Probe(
+                x=self.split_heads(x), drive=drive, couplings=couplings, initial=initial
+            )
+            if probe
+            else None,
         )
 
     @torch.no_grad()
@@ -372,7 +404,7 @@ class SpinModelTransformerModule(nn.Module):
         step_fn = partial(
             mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta
         )
-        steady = fp.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
+        steady = fp.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol).solution
 
         fields = mf.effective_field(trajectory, drive, couplings)
         steady_field = mf.effective_field(steady, drive, couplings)

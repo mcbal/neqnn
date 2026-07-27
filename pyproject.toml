@@ -20,16 +20,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "einops>=0.8.2",
-    "matplotlib>=3.10.0",
     "numpy>=2.4.2",
     "torch>=2.10.0",
 ]
 
 [dependency-groups]
-# scipy is a test-only reference for the Bessel and normalizer routines, never
-# imported by the package itself -- which is the point, since it underflows
-# exactly where our recurrence has to keep working.
-dev = ["pytest>=8.0", "scipy>=1.14"]
+# None of these are imported by the package itself.  scipy is a test-only
+# reference for the Bessel and normalizer routines -- which is the point, since
+# it underflows exactly where our recurrence has to keep working -- and
+# matplotlib serves only the experiment scripts.
+dev = ["matplotlib>=3.10.0", "pytest>=8.0", "scipy>=1.14"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

@@ -1,0 +1,102 @@
+"""Single-site vMF mathematics: Bessel routines, moments, sampler, large-D forms."""
+
+from __future__ import annotations
+
+import math
+
+import numpy
+import pytest
+import torch
+
+from helpers import DIMS, random_problem, relative, slope_in_dim
+from neqnn import stochastic, vmf
+
+
+def test_order_and_radius_enforce_the_convention():
+    for dim in DIMS:
+        assert vmf.radius(dim) == pytest.approx(math.sqrt(dim / 2 - 1))
+    for dim in (0, 1, 2):
+        with pytest.raises(ValueError):
+            vmf.order(dim)
+
+
+def test_bessel_ratio_matches_scipy_where_scipy_survives():
+    ive = pytest.importorskip("scipy.special").ive
+    x = torch.tensor([1e-2, 0.1, 1.0, 10.0, 100.0, 500.0])
+    for dim in DIMS:
+        ours = vmf.bessel_ratio(x, dim / 2 - 1)
+        with numpy.errstate(invalid="ignore", divide="ignore"):
+            reference = torch.as_tensor(
+                ive(dim / 2, x.numpy()) / ive(dim / 2 - 1, x.numpy())
+            )
+        finite = torch.isfinite(reference)
+        assert torch.allclose(ours[finite], reference[finite], rtol=1e-7)
+        # Underflow kills scipy at large order and small argument; the backward
+        # recurrence returns the correct x/D there, which is the reason it exists.
+        assert torch.all(ours > 0)
+
+
+def test_bessel_ratio_small_argument_limit():
+    for dim in DIMS:
+        x = torch.tensor([1e-8])
+        assert vmf.bessel_ratio(x, dim / 2 - 1).item() == pytest.approx(
+            float(x) / dim, rel=1e-6
+        )
+
+
+def test_log_normalizer_matches_scipy():
+    special = pytest.importorskip("scipy.special")
+    kappa = torch.tensor([0.5, 5.0, 50.0, 200.0])
+    for dim in (8, 64):
+        order = dim / 2 - 1
+        reference = (
+            order * torch.log(kappa)
+            - (torch.log(torch.as_tensor(special.ive(order, kappa.numpy()))) + kappa)
+            - order * math.log(2)
+            - special.gammaln(order + 1)
+        )
+        assert torch.allclose(vmf.log_normalizer(kappa, dim), reference, atol=1e-9)
+
+
+def test_sampler_reproduces_closed_form_moments():
+    dim, sites, beta, draws = 32, 4, 1.0, 200_000
+    field = stochastic.random_state((sites,), dim)
+    samples = vmf.sample_from_field(field.expand(draws, sites, dim), beta)
+
+    mean = samples.mean(0)
+    error = float(samples.std(0).norm() / draws**0.5)
+    assert float((mean - vmf.response(field, beta)).norm()) < 4 * error
+
+    centered = samples - mean
+    covariance = torch.einsum("tnd,tne->nde", centered, centered) / draws
+    assert relative(covariance, vmf.covariance(field, beta)) < 0.02
+
+
+def test_covariance_agrees_with_its_variances():
+    dim, beta = 64, 1.0
+    field = stochastic.random_state((6,), dim)
+    tangential, radial = vmf.variances(field, beta)
+    covariance = vmf.covariance(field, beta)
+    direction = torch.nn.functional.normalize(field, dim=-1)
+    along = torch.einsum("nd,nde,ne->n", direction, covariance, direction)
+    assert torch.allclose(along, radial)
+    trace = covariance.diagonal(dim1=-2, dim2=-1).sum(-1)
+    assert torch.allclose(trace, radial + (dim - 1) * tangential)
+
+
+@pytest.mark.parametrize("quantity", ["response", "covariance", "kl"])
+def test_large_d_forms_converge_as_one_over_dim(quantity):
+    beta = 1.0
+    errors = []
+    for dim in DIMS:
+        field, _ = random_problem(dim)
+        other = stochastic.random_state((8,), dim)
+        if quantity == "response":
+            pair = vmf.response_large_d(field, beta), vmf.response(field, beta)
+        elif quantity == "covariance":
+            pair = vmf.covariance_large_d(field, beta), vmf.covariance(field, beta)
+        else:
+            pair = vmf.kl_large_d(field, other, beta), vmf.kl(field, other, beta)
+        errors.append(relative(*pair))
+    assert slope_in_dim(errors) < -0.9
+    assert errors[-1] < 0.01
