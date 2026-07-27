@@ -33,6 +33,25 @@ def test_anderson_reports_non_convergence_honestly():
     solve = fp.anderson(step_fn, torch.zeros_like(drive), max_iter=3, tol=1e-12)
     assert not solve.converged
     assert solve.residual > 1e-12
+    # Evidence must describe the exact tensor returned, including outside the
+    # regime where applying the map once more is guaranteed to improve it.
+    assert solve.residual == pytest.approx(
+        fp.residual(step_fn(solve.solution), solve.solution)
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_iter": 1}, "max_iter"),
+        ({"memory": 1}, "memory"),
+        ({"tol": 0}, "tol"),
+        ({"ridge": -1}, "ridge"),
+    ],
+)
+def test_anderson_validates_solver_settings(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        fp.anderson(lambda x: x, torch.zeros(2, 3), **kwargs)
 
 
 def test_anderson_handles_an_already_converged_problem():

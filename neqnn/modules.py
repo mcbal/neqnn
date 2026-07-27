@@ -30,6 +30,8 @@ a flag rather than a default.
 
 from __future__ import annotations
 
+import math
+import warnings
 from functools import partial
 from typing import Literal, NamedTuple
 
@@ -63,8 +65,29 @@ def advance(
     no relaxation history.  Pass ``fill`` to seed them with an amortized guess
     instead.
     """
+    if not isinstance(drop, int) or isinstance(drop, bool) or drop < 0:
+        raise ValueError(f"drop must be a non-negative integer, got {drop!r}")
+    if not isinstance(add, int) or isinstance(add, bool) or add < 0:
+        raise ValueError(f"add must be a non-negative integer, got {add!r}")
+    if state.magnetizations.ndim < 2:
+        raise ValueError(
+            "state magnetizations must have shape (..., sites, dim), got "
+            f"{tuple(state.magnetizations.shape)}"
+        )
+    sites = state.magnetizations.shape[-2]
+    if drop > sites:
+        raise ValueError(f"cannot drop {drop} sites from a state with {sites} sites")
     magnetizations = state.magnetizations[..., drop:, :]
     if add:
+        expected = (*magnetizations.shape[:-2], add, magnetizations.shape[-1])
+        if fill is not None and tuple(fill.shape) != expected:
+            raise ValueError(
+                f"fill must have shape {expected} for add={add}, got {tuple(fill.shape)}"
+            )
+        if fill is not None and (
+            fill.dtype != magnetizations.dtype or fill.device != magnetizations.device
+        ):
+            raise ValueError("fill must share the state's dtype and device")
         tail = (
             fill
             if fill is not None
@@ -73,6 +96,8 @@ def advance(
             )
         )
         magnetizations = torch.cat([magnetizations, tail], dim=-2)
+    elif fill is not None:
+        raise ValueError("fill was provided but add=0")
     return MeanFieldState(magnetizations=magnetizations)
 
 
@@ -93,10 +118,20 @@ class Probe(NamedTuple):
 
 
 class Readout(NamedTuple):
+    """Physical state, optional learned readout, and fixed-point evidence.
+
+    ``magnetizations`` always remains inside the physical mean-field state
+    space.  ``output`` is the possibly post-mixed tensor intended for downstream
+    neural-network use; it is identical to ``magnetizations`` when
+    ``post_mix=False``.
+    """
+
     magnetizations: Tensor
     state: MeanFieldState
     entropy_production: Tensor | None = None
     probe: Probe | None = None
+    output: Tensor | None = None
+    fixed_point: fp.Solve | None = None
 
 
 class Relaxation(NamedTuple):
@@ -106,6 +141,7 @@ class Relaxation(NamedTuple):
     mismatch: Tensor
     entropy_production: Tensor
     residual: Tensor
+    fixed_point: fp.Solve
 
 
 class SpinModelTransformerModule(nn.Module):
@@ -130,15 +166,58 @@ class SpinModelTransformerModule(nn.Module):
         measure_entropy_production: bool = False,
     ):
         super().__init__()
+        if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
+            raise ValueError(f"dim must be a positive integer, got {dim!r}")
+        if (
+            not isinstance(num_heads, int)
+            or isinstance(num_heads, bool)
+            or num_heads <= 0
+        ):
+            raise ValueError(
+                f"num_heads must be a positive integer, got {num_heads!r}"
+            )
         if dim % num_heads:
             raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
-        if num_steps is not None and num_steps < 1:
+        dim_head = dim // num_heads
+        if dim_head <= 2:
+            raise ValueError(
+                "the spin-radius convention requires dim / num_heads > 2, "
+                f"got head dimension {dim_head}"
+            )
+        if init not in {"reset", "amortized", "carried"}:
+            raise ValueError(
+                "init must be one of 'reset', 'amortized', or 'carried', "
+                f"got {init!r}"
+            )
+        if num_steps is not None and (
+            not isinstance(num_steps, int)
+            or isinstance(num_steps, bool)
+            or num_steps < 1
+        ):
             raise ValueError(
                 f"num_steps must be a positive int or None, got {num_steps}"
             )
+        if not math.isfinite(beta) or beta <= 0:
+            raise ValueError(f"beta must be finite and positive, got {beta}")
+        if (
+            not isinstance(max_iter, int)
+            or isinstance(max_iter, bool)
+            or max_iter < 2
+        ):
+            raise ValueError(f"max_iter must be an integer >= 2, got {max_iter!r}")
+        if not math.isfinite(tol) or tol <= 0:
+            raise ValueError(f"tol must be finite and positive, got {tol}")
+        if not math.isfinite(rope_base) or rope_base <= 0:
+            raise ValueError(
+                f"rope_base must be finite and positive, got {rope_base}"
+            )
+        if rope and dim_head % 2:
+            raise ValueError(
+                f"rope requires an even head dimension, got {dim_head}"
+            )
 
         self.dim = dim
-        self.dim_head = dim // num_heads
+        self.dim_head = dim_head
         self.num_heads = num_heads
         self.radius_head = vmf.radius(self.dim_head)
 
@@ -168,11 +247,15 @@ class SpinModelTransformerModule(nn.Module):
         self.drive_norm = nn.RMSNorm(self.dim_head, elementwise_affine=True)
         nn.init.constant_(self.drive_norm.weight, self.radius_head / self.dim_head**0.5)
 
-        # Attention sharpness. A fixed 1/sqrt(d) works when queries and keys are
-        # unnormalized, because training sharpens attention by growing their
-        # norms. `qk_norm` pins those norms to 1 and removes that lever
-        # entirely, so the scale has to come back as an explicit parameter.
-        self.attn_temperature = nn.Parameter(torch.tensor(float(self.dim_head) ** 0.5))
+        # Attention sharpness. With normalized Q/K the learned scalar is the
+        # entire logit scale. Keep the established sqrt(D_head) operating point;
+        # unlike the physical response scale this is a neural-network parameter,
+        # not something bounded by R. Its magnitude is used in the forward pass
+        # so optimization cannot silently turn similarity attention into
+        # anti-similarity attention.
+        self.attn_temperature = nn.Parameter(
+            torch.tensor(float(self.dim_head) ** 0.5)
+        )
 
         # Disabling drops the memory term from the drive entirely.
         self.ffn = (
@@ -247,11 +330,11 @@ class SpinModelTransformerModule(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """The field ``x + f_FFN(norm(x))`` and coupling rule ``J(norm(x))``.
 
-        With ``qk_norm`` the logit is ``R_head cos(q, k)``, bounded by the head
-        radius whatever the weights do -- stable, but it also means query and key
-        *magnitude* carries no information and the usual lever on attention
-        sharpness is disconnected.  Without it the logit is the plain scaled dot
-        product, so norms are free to grow and sharpen the couplings.
+        With ``qk_norm`` the logit is ``temperature * cos(q, k)``. The positive
+        learned temperature starts at ``sqrt(D_head)``; query and key magnitude
+        carries no information, so sharpness lives entirely in that scalar.
+        Without normalization it scales the plain dot product by
+        ``temperature / D``.
 
         ``normalized`` lets forward paths reuse their normalized input for the
         amortized V initialization.  Diagnostic callers can omit it.
@@ -263,24 +346,33 @@ class SpinModelTransformerModule(nn.Module):
 
         if self.qk_norm:
             queries, keys = map(lambda t: F.normalize(t, dim=-1), (queries, keys))
-            scale = self.attn_temperature
+            scale = self.attn_temperature.abs()
         else:
-            scale = self.attn_temperature / self.dim_head
+            scale = self.attn_temperature.abs() / self.dim_head
         if self.rope:
             cos, sin = self.rotary(x.shape[-2], x.device, x.dtype)
             queries, keys = (self.apply_rotary(t, cos, sin) for t in (queries, keys))
         sim = scale * torch.einsum("bhid,bhjd->bhij", queries, keys)
+        available = torch.ones(
+            x.shape[0],
+            1,
+            x.shape[-2],
+            x.shape[-2],
+            dtype=torch.bool,
+            device=x.device,
+        )
         if mask is not None:
-            sim = sim.masked_fill(
-                ~rearrange(mask, "b j -> b 1 1 j"), -torch.finfo(sim.dtype).max
-            )
+            available = available & rearrange(mask, "b j -> b 1 1 j")
         if self.causal:
-            sim = sim.masked_fill(
-                rearrange(
-                    self.causal_mask(sim.shape[-1], sim.device), "i j -> 1 1 i j"
-                ),
-                -torch.finfo(sim.dtype).max,
+            available = available & ~rearrange(
+                self.causal_mask(sim.shape[-1], sim.device), "i j -> 1 1 i j"
             )
+        if not bool(available.any(-1).all()):
+            raise ValueError(
+                "mask leaves at least one query with no available key; "
+                "softmax over a fully masked row is undefined"
+            )
+        sim = sim.masked_fill(~available, -torch.finfo(sim.dtype).max)
         return drive, sim.softmax(dim=-1)
 
     def causal_mask(self, n: int, device) -> Tensor:
@@ -311,9 +403,9 @@ class SpinModelTransformerModule(nn.Module):
     # Relaxation
     #
 
-    def settle(
+    def _settle_with_evidence(
         self, start: Tensor, drive: Tensor, couplings: Tensor
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, fp.Solve | None]:
         """Relax to the horizon set by ``num_steps``, returning the last two iterates.
 
         The previous iterate is kept because the delayed correlations that feed
@@ -330,15 +422,79 @@ class SpinModelTransformerModule(nn.Module):
         )
         if self.num_steps is None:
             with torch.no_grad():
-                solved = fp.anderson(
+                solve = fp.anderson(
                     step_fn, start, max_iter=self.max_iter, tol=self.tol
-                ).solution
-            settled = fp.implicit_grad(step_fn, solved, max_iter=self.max_iter)
-            return settled, settled
+                )
+            if not solve.converged:
+                warnings.warn(
+                    f"fixed-point forward residual {solve.residual:.2e} exceeds "
+                    f"tol {self.tol:.2e}; output and implicit gradient may be "
+                    "untrustworthy",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+            settled = fp.implicit_grad(
+                step_fn, solve.solution, max_iter=self.max_iter
+            )
+            return settled, settled, solve
         previous, current = start, start
         for _ in range(self.num_steps):
             previous, current = current, step_fn(current)
-        return current, previous
+        return current, previous, None
+
+    def settle(
+        self, start: Tensor, drive: Tensor, couplings: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Settle while preserving the historical two-tensor public interface."""
+        settled, previous, _ = self._settle_with_evidence(
+            start, drive, couplings
+        )
+        return settled, previous
+
+    def _validate_inputs(
+        self, x: Tensor, state: MeanFieldState | None, mask: Tensor | None
+    ) -> None:
+        if x.ndim != 3:
+            raise ValueError(
+                f"x must have shape (batch, sites, dim), got {tuple(x.shape)}"
+            )
+        if not x.is_floating_point():
+            raise TypeError(f"x must be floating point, got {x.dtype}")
+        if x.shape[-1] != self.dim:
+            raise ValueError(
+                f"x has feature dimension {x.shape[-1]}, expected {self.dim}"
+            )
+        if x.shape[-2] < 1:
+            raise ValueError("x must contain at least one site")
+        if mask is not None:
+            expected = x.shape[:2]
+            if tuple(mask.shape) != expected:
+                raise ValueError(
+                    f"mask must have shape {tuple(expected)}, got {tuple(mask.shape)}"
+                )
+            if mask.dtype != torch.bool:
+                raise TypeError(f"mask must be boolean, got {mask.dtype}")
+            if mask.device != x.device:
+                raise ValueError("mask and x must be on the same device")
+        if state is not None:
+            expected = (
+                x.shape[0],
+                self.num_heads,
+                x.shape[1],
+                self.dim_head,
+            )
+            if tuple(state.magnetizations.shape) != expected:
+                raise ValueError(
+                    "state magnetizations must have shape "
+                    f"{expected}, got {tuple(state.magnetizations.shape)}"
+                )
+            if (
+                state.magnetizations.dtype != x.dtype
+                or state.magnetizations.device != x.device
+            ):
+                raise ValueError(
+                    "state magnetizations must share x's dtype and device"
+                )
 
     def forward(
         self,
@@ -348,11 +504,14 @@ class SpinModelTransformerModule(nn.Module):
         *,
         probe: bool = False,
     ) -> Readout:
+        self._validate_inputs(x, state, mask)
         x = self.pre_mix(x)
         normalized = self.normalize(x)
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
         initial = self.initial(normalized, state)
-        settled, previous = self.settle(initial, drive, couplings)
+        settled, previous, solve = self._settle_with_evidence(
+            initial, drive, couplings
+        )
 
         entropy_production = None
         if self.measure_entropy_production:
@@ -366,8 +525,9 @@ class SpinModelTransformerModule(nn.Module):
 
         # The returned state is not detached: truncating the history is the
         # caller's decision, not something the module should make silently.
+        magnetizations = self.merge_heads(settled)
         return Readout(
-            magnetizations=self.post_mix(self.merge_heads(settled)),
+            magnetizations=magnetizations,
             state=MeanFieldState(magnetizations=settled),
             entropy_production=entropy_production,
             probe=Probe(
@@ -375,6 +535,8 @@ class SpinModelTransformerModule(nn.Module):
             )
             if probe
             else None,
+            output=self.post_mix(magnetizations),
+            fixed_point=solve,
         )
 
     @torch.no_grad()
@@ -394,6 +556,8 @@ class SpinModelTransformerModule(nn.Module):
         separately, so this reports the approach to the steady state even when
         the module itself runs at finite K and never computes one.
         """
+        self._validate_inputs(x, state, mask)
+        x = self.pre_mix(x)
         normalized = self.normalize(x)
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
         start = self.initial(normalized, state)
@@ -404,7 +568,18 @@ class SpinModelTransformerModule(nn.Module):
         step_fn = partial(
             mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta
         )
-        steady = fp.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol).solution
+        solve = fp.anderson(
+            step_fn, start, max_iter=self.max_iter, tol=self.tol
+        )
+        if not solve.converged:
+            warnings.warn(
+                f"diagnostic fixed-point residual {solve.residual:.2e} exceeds "
+                f"tol {self.tol:.2e}; mismatch is measured against an "
+                "unconverged reference",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        steady = solve.solution
 
         fields = mf.effective_field(trajectory, drive, couplings)
         steady_field = mf.effective_field(steady, drive, couplings)
@@ -417,4 +592,5 @@ class SpinModelTransformerModule(nn.Module):
                 couplings, traces, self.beta
             ),
             residual=(trajectory[1:] - trajectory[:-1]).norm(dim=-1).amax(dim=-1),
+            fixed_point=solve,
         )

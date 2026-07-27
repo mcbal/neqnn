@@ -12,6 +12,7 @@ Seed with ``torch.manual_seed``; no generator is threaded through.
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
@@ -19,6 +20,63 @@ from einops import einsum
 from torch import Tensor
 
 from neqnn import vmf
+
+
+def _validate_simulation(
+    drive: Tensor,
+    couplings: Tensor,
+    beta: float,
+    *,
+    num_chains: int,
+    num_steps: int,
+    burn_in: int,
+    estimate: bool,
+) -> None:
+    if drive.ndim != 2:
+        raise ValueError(
+            f"drive must have shape (sites, dim), got {tuple(drive.shape)}"
+        )
+    if not drive.is_floating_point():
+        raise TypeError(f"drive must be floating point, got {drive.dtype}")
+    sites, dim = drive.shape
+    if dim <= 2:
+        raise ValueError(f"spin dimension must be > 2, got {dim}")
+    if tuple(couplings.shape) != (sites, sites):
+        raise ValueError(
+            f"couplings must have shape {(sites, sites)}, got {tuple(couplings.shape)}"
+        )
+    if (
+        couplings.dtype != drive.dtype
+        or couplings.device != drive.device
+        or not couplings.is_floating_point()
+    ):
+        raise ValueError("couplings must share drive's floating dtype and device")
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError(f"beta must be finite and positive, got {beta}")
+    minimum_chains = 2 if estimate else 1
+    if (
+        not isinstance(num_chains, int)
+        or isinstance(num_chains, bool)
+        or num_chains < minimum_chains
+    ):
+        raise ValueError(
+            f"num_chains must be an integer >= {minimum_chains}, got {num_chains!r}"
+        )
+    minimum_steps = 2 if estimate else 1
+    if (
+        not isinstance(num_steps, int)
+        or isinstance(num_steps, bool)
+        or num_steps < minimum_steps
+    ):
+        raise ValueError(
+            f"num_steps must be an integer >= {minimum_steps}, got {num_steps!r}"
+        )
+    if (
+        not isinstance(burn_in, int)
+        or isinstance(burn_in, bool)
+        or burn_in < 0
+    ):
+        raise ValueError(f"burn_in must be a non-negative integer, got {burn_in!r}")
 
 
 def effective_field(state: Tensor, drive: Tensor, couplings: Tensor) -> Tensor:
@@ -57,7 +115,16 @@ def simulate(
     4000 steps is 125 GiB.  Use ``estimate`` for stationary averages, which
     streams the same chains and keeps only the accumulators.
     """
-    sites, dim = drive.shape[-2:]
+    _validate_simulation(
+        drive,
+        couplings,
+        beta,
+        num_chains=num_chains,
+        num_steps=num_steps,
+        burn_in=burn_in,
+        estimate=False,
+    )
+    sites, dim = drive.shape
     kwargs = dict(dtype=drive.dtype, device=drive.device)
     state = random_state((num_chains, sites), dim, **kwargs)
     for _ in range(burn_in):
@@ -112,7 +179,16 @@ def estimate(
     float64 at these magnitudes the cancellation costs a few digits out of
     fifteen -- far below Monte Carlo error.
     """
-    sites, dim = drive.shape[-2:]
+    _validate_simulation(
+        drive,
+        couplings,
+        beta,
+        num_chains=num_chains,
+        num_steps=num_steps,
+        burn_in=burn_in,
+        estimate=True,
+    )
+    sites, dim = drive.shape
     kwargs = dict(dtype=drive.dtype, device=drive.device)
     state = random_state((num_chains, sites), dim, **kwargs)
     for _ in range(burn_in):

@@ -14,6 +14,7 @@ The trajectory of the physical relaxation is a different object and lives in
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Iterable, NamedTuple
 
@@ -29,11 +30,11 @@ def residual(magnetizations: Tensor, previous: Tensor) -> float:
 class Solve(NamedTuple):
     """A fixed point together with the evidence for it.
 
-    ``residual`` is the worst-site update at the last accepted iterate; the
-    returned ``solution`` is that iterate's image, so its true residual is
-    smaller still wherever the map contracts.  Returning the evidence with the
-    point is deliberate: a solution reported without its residual invites
-    exactly the mistake of trusting an unconverged solve.
+    ``residual`` is the worst-site update size of ``solution`` itself:
+    ``||f(solution) - solution||``.  Returning evidence for the exact tensor
+    handed to the caller is deliberate: reporting the residual of a neighbouring
+    iterate is only safe under contraction, precisely the assumption that may
+    fail in the regimes this solver is used to diagnose.
     """
 
     solution: Tensor
@@ -67,7 +68,26 @@ def anderson(
     Leading axes are independent problems, solved in parallel; the residual and
     the convergence flag are taken over the worst of them.
     """
+    if initial.ndim < 2:
+        raise ValueError(
+            f"initial must have shape (..., sites, dim), got {tuple(initial.shape)}"
+        )
+    if not initial.is_floating_point():
+        raise TypeError(f"initial must be floating point, got {initial.dtype}")
+    if not isinstance(max_iter, int) or isinstance(max_iter, bool) or max_iter < 2:
+        raise ValueError(f"max_iter must be an integer >= 2, got {max_iter!r}")
+    if not isinstance(memory, int) or isinstance(memory, bool) or memory < 2:
+        raise ValueError(f"memory must be an integer >= 2, got {memory!r}")
+    if not math.isfinite(tol) or tol <= 0:
+        raise ValueError(f"tol must be finite and positive, got {tol}")
+    if not math.isfinite(ridge) or ridge < 0:
+        raise ValueError(f"ridge must be finite and non-negative, got {ridge}")
+
     sites, dim = initial.shape[-2:]
+    if sites < 1 or dim < 1:
+        raise ValueError(
+            f"initial must have non-empty sites and dim axes, got {tuple(initial.shape)}"
+        )
     batch_shape = initial.shape[:-2]
     width = sites * dim
     to_flat = lambda t: t.reshape(-1, width)
@@ -88,7 +108,11 @@ def anderson(
     system[:, 1:, 0] = 1.0
     target[:, 0] = 1.0
 
-    gap = lambda slot: float((images[:, slot] - iterates[:, slot]).norm(dim=-1).max())
+    def gap(slot: int) -> float:
+        difference = (images[:, slot] - iterates[:, slot]).reshape(
+            -1, sites, dim
+        )
+        return float(difference.norm(dim=-1).max())
 
     slot = 1
     for step in range(2, max_iter):
@@ -111,8 +135,11 @@ def anderson(
         slot = step % memory
         iterates[:, slot] = (weights @ images[:, :window])[:, 0]
         images[:, slot] = to_flat(step_fn(to_state(iterates[:, slot])))
+    # ``gap(slot)`` belongs to the iterate in this slot, so return that same
+    # tensor.  The old implementation returned its image while retaining this
+    # residual; those are interchangeable only when the map already contracts.
     final = gap(slot)
-    return Solve(to_state(images[:, slot]), final, final < tol)
+    return Solve(to_state(iterates[:, slot]), final, final < tol)
 
 
 def implicit_grad(

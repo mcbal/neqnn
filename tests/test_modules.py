@@ -23,8 +23,12 @@ def test_every_quadrant_runs_forward_and_backward(num_steps, init):
     x = torch.randn(2, 16, 64)
     readout = module(x)
     assert readout.magnetizations.shape == x.shape
+    assert readout.output.shape == x.shape
     assert readout.state.magnetizations.shape == (2, 4, 16, 16)
     assert float(readout.entropy_production.detach().min()) >= 0
+    assert (readout.fixed_point is not None) == (num_steps is None)
+    if readout.fixed_point is not None:
+        assert readout.fixed_point.converged
     readout.magnetizations.sum().backward()
     assert module.drive_norm.weight.grad is not None
 
@@ -101,6 +105,92 @@ def test_advance_realigns_the_window():
     assert moved.magnetizations.shape == state.magnetizations.shape
     assert torch.allclose(moved.magnetizations[..., :-1, :], state.magnetizations[..., 1:, :])
     assert torch.all(moved.magnetizations[..., -1, :] == 0)
+
+
+def test_advance_validates_shape_and_fill():
+    state = SpinModelTransformerModule(dim=64, num_heads=2).forward(
+        torch.randn(1, 4, 64)
+    ).state
+    with pytest.raises(ValueError, match="cannot drop"):
+        advance(state, drop=5)
+    with pytest.raises(ValueError, match="fill must have shape"):
+        advance(state, fill=torch.zeros(1, 2, 2, 32))
+    with pytest.raises(ValueError, match="add=0"):
+        advance(state, add=0, fill=torch.zeros(1, 2, 0, 32))
+
+
+def test_post_mix_is_output_only():
+    module = SpinModelTransformerModule(
+        dim=64, num_heads=2, num_steps=2, post_mix=True
+    )
+    readout = module(torch.randn(2, 8, 64))
+    physical = module.merge_heads(readout.state.magnetizations)
+    assert torch.allclose(readout.magnetizations, physical)
+    assert torch.allclose(readout.output, module.post_mix(physical))
+    assert not torch.allclose(readout.output, readout.magnetizations)
+
+
+def test_relaxation_applies_pre_mix_like_forward():
+    module = SpinModelTransformerModule(
+        dim=64,
+        num_heads=2,
+        num_steps=1,
+        init="amortized",
+        pre_mix=True,
+    )
+    x = torch.randn(2, 8, 64)
+    readout = module(x)
+    trace = module.relaxation(x, num_steps=1)
+    assert torch.allclose(trace.magnetizations[-1], readout.state.magnetizations)
+    assert trace.fixed_point.converged
+
+
+def test_fixed_point_non_convergence_is_loud_and_attached():
+    module = SpinModelTransformerModule(
+        dim=64,
+        num_heads=2,
+        num_steps=None,
+        max_iter=2,
+        tol=1e-15,
+    )
+    with pytest.warns(RuntimeWarning, match="fixed-point forward residual"):
+        readout = module(torch.randn(1, 8, 64))
+    assert readout.fixed_point is not None
+    assert not readout.fixed_point.converged
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dim": 0},
+        {"dim": 64, "num_heads": 0},
+        {"dim": 64, "init": "typo"},
+        {"dim": 64, "num_steps": 0},
+        {"dim": 64, "beta": 0},
+        {"dim": 64, "max_iter": 1},
+        {"dim": 64, "tol": 0},
+        {"dim": 64, "rope_base": 0},
+        {"dim": 15, "num_heads": 3, "rope": True},
+        {"dim": 4, "num_heads": 2},
+    ],
+)
+def test_constructor_rejects_invalid_configuration(kwargs):
+    with pytest.raises(ValueError):
+        SpinModelTransformerModule(**kwargs)
+
+
+def test_forward_validates_mask_and_state():
+    module = SpinModelTransformerModule(dim=64, num_heads=2, causal=True)
+    x = torch.randn(1, 4, 64)
+    with pytest.raises(ValueError, match="no available key"):
+        module(x, mask=torch.zeros(1, 4, dtype=torch.bool))
+    with pytest.raises(TypeError, match="boolean"):
+        module(x, mask=torch.ones(1, 4))
+    with pytest.raises(ValueError, match="state magnetizations"):
+        module(
+            x,
+            state=type(module(x).state)(magnetizations=torch.zeros(1, 2, 3, 32)),
+        )
 
 
 def test_relaxation_traces_a_converging_path():

@@ -1,7 +1,7 @@
 # neqnn
 
 Nonequilibrium dynamics in spin-model transformers — companion code for
-[this post](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
+[this post](https://mcbal.github.io/post/entropy-production-in-nonequilibrium-neural-networks/).
 
 A transformer block whose forward pass *is* the relaxation of a vector-spin
 system. Spins live on a sphere of radius `R`, softmax attention supplies the
@@ -27,7 +27,9 @@ module = SpinModelTransformerModule(
 )
 
 out = module(torch.randn(1, 32, 256))
-out.magnetizations       # (1, 32, 256)
+out.magnetizations       # physical mean-field state, (1, 32, 256)
+out.output               # possibly post-mixed neural-network readout
 out.state                # feed to the next drive step
 out.entropy_production   # housekeeping cost of the steady state
+out.fixed_point          # solver evidence when num_steps=None, otherwise None
 ```

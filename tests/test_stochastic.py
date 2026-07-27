@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from helpers import random_problem, relative
@@ -58,3 +59,40 @@ def test_transition_logp_ratio_is_normalized_under_the_proposal():
     weights = (logp(other) - logp(source)).exp()
     error = float(weights.std() / draws**0.5)
     assert abs(float(weights.mean()) - 1.0) < 4 * error
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"num_chains": 1}, "num_chains"),
+        ({"num_steps": 1}, "num_steps"),
+        ({"burn_in": -1}, "burn_in"),
+        ({"beta": 0}, "beta"),
+    ],
+)
+def test_estimate_rejects_invalid_sampling_budget(overrides, message):
+    drive, couplings = random_problem(8, 2)
+    settings = dict(
+        drive=drive,
+        couplings=couplings,
+        beta=1.0,
+        num_chains=2,
+        num_steps=2,
+        burn_in=0,
+    )
+    settings.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        stochastic.estimate(**settings)
+
+
+def test_simulation_validates_problem_shapes():
+    drive, couplings = random_problem(8, 2)
+    with pytest.raises(ValueError, match="couplings must have shape"):
+        stochastic.simulate(
+            drive,
+            couplings[:1],
+            1.0,
+            num_chains=1,
+            num_steps=1,
+            burn_in=0,
+        )

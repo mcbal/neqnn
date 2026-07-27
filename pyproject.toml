@@ -36,3 +36,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["neqnn"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
