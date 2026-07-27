@@ -116,7 +116,9 @@ class SpinModelTransformerModule(nn.Module):
         if dim % num_heads:
             raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
         if num_steps is not None and num_steps < 1:
-            raise ValueError(f"num_steps must be a positive int or None, got {num_steps}")
+            raise ValueError(
+                f"num_steps must be a positive int or None, got {num_steps}"
+            )
 
         self.dim = dim
         self.dim_head = dim // num_heads
@@ -138,33 +140,24 @@ class SpinModelTransformerModule(nn.Module):
         self.merge_heads = Rearrange("b h n d -> b n (h d)")
 
         # ``qk_bias`` adds a content-independent component to queries and keys.
-        # With zero-mean embeddings and no bias, rope has no constant vector to
-        # rotate, so *positional-only* attention lobes are unrepresentable and
-        # single-layer induction measurably fails to form; the bias restores
-        # that pathway (experiments README, single-pass induction result).
         self.to_qk = nn.Linear(dim, 2 * dim, bias=qk_bias)
         self.to_v = nn.Linear(dim, dim, bias=False)
 
         # Ordinary RMS norm for the learned branches, with the physics living
         # entirely in the init: a uniform gain of R / sqrt(dim_head) gives each
-        # normalized head norm exactly R.  As in PaLM's parallel block, the
-        # direct input drive bypasses this norm while Q/K/V and the FFN consume
-        # the normalized stream.  RMS rather than layer norm because subtracting
-        # the mean would remove the component along the all-ones vector, an
-        # arbitrary coordinate axis with no meaning for spins on a sphere.
+        # normalized head norm exactly R. RMS rather than layer norm because
+        # subtracting the mean would remove the component along the all-ones vector,
+        # an arbitrary coordinate axis with no meaning for spins on a sphere.
         self.drive_norm = nn.RMSNorm(self.dim_head, elementwise_affine=True)
         nn.init.constant_(self.drive_norm.weight, self.radius_head / self.dim_head**0.5)
 
-        # Attention sharpness.  A fixed 1/sqrt(d) works when queries and keys are
+        # Attention sharpness. A fixed 1/sqrt(d) works when queries and keys are
         # unnormalized, because training sharpens attention by growing their
-        # norms.  `qk_norm` pins those norms to 1 and removes that lever
-        # entirely, so the scale has to come back as an explicit parameter --
-        # the same pairing QK-norm architectures use.
+        # norms. `qk_norm` pins those norms to 1 and removes that lever
+        # entirely, so the scale has to come back as an explicit parameter.
         self.attn_temperature = nn.Parameter(torch.tensor(float(self.dim_head) ** 0.5))
 
-        # Disabling drops the memory term from the drive entirely.  It cannot be
-        # an nn.Identity: the drive is ``x + f_FFN(norm(x))``, so an identity
-        # would add the normalized stream rather than remove the term.
+        # Disabling drops the memory term from the drive entirely.
         self.ffn = (
             nn.Sequential(
                 nn.Linear(dim, 4 * dim, bias=False),
@@ -193,13 +186,8 @@ class SpinModelTransformerModule(nn.Module):
         Spins are pure direction; fields are not, and their magnitude is
         physical -- ``kappa = beta R ||h||`` is how hard a site is pinned -- so
         forcing every drive onto one sphere throws that away.
-
-        Plain layer norm also puts every vector on a sphere; the per-token norm
-        variation in a transformer comes entirely from the learnable gain, which
-        makes the radius depend on direction.  The gain is uniform at init, so
-        norms all start at R, and training is free to spread them.
         """
-        return self.merge_heads(self.drive_norm(self.split_heads(self.pre_mix(x))))
+        return self.merge_heads(self.drive_norm(self.split_heads(x)))
 
     def rotary(self, n: int, device, dtype) -> tuple[Tensor, Tensor]:
         """Rotary angles for relative positions, cached on the buffer.
@@ -213,14 +201,23 @@ class SpinModelTransformerModule(nn.Module):
         if self.rope_cache is not None and self.rope_cache.shape[-2] >= n:
             cached = self.rope_cache[..., :n, :]
             return cached[0], cached[1]
-        power = torch.arange(0, self.dim_head, 2, device=device, dtype=dtype) / self.dim_head
-        angles = torch.outer(torch.arange(n, device=device, dtype=dtype), self.rope_base**-power)
-        self.register_buffer("rope_cache", torch.stack([angles.cos(), angles.sin()]), persistent=False)
+        power = (
+            torch.arange(0, self.dim_head, 2, device=device, dtype=dtype)
+            / self.dim_head
+        )
+        angles = torch.outer(
+            torch.arange(n, device=device, dtype=dtype), self.rope_base**-power
+        )
+        self.register_buffer(
+            "rope_cache", torch.stack([angles.cos(), angles.sin()]), persistent=False
+        )
         return angles.cos(), angles.sin()
 
     def apply_rotary(self, t: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         even, odd = t[..., 0::2], t[..., 1::2]
-        return torch.stack([even * cos - odd * sin, even * sin + odd * cos], dim=-1).flatten(-2)
+        return torch.stack(
+            [even * cos - odd * sin, even * sin + odd * cos], dim=-1
+        ).flatten(-2)
 
     def drive_and_couplings(
         self, x: Tensor, mask: Tensor | None, *, normalized: Tensor | None = None
@@ -251,10 +248,14 @@ class SpinModelTransformerModule(nn.Module):
             queries, keys = (self.apply_rotary(t, cos, sin) for t in (queries, keys))
         sim = scale * torch.einsum("bhid,bhjd->bhij", queries, keys)
         if mask is not None:
-            sim = sim.masked_fill(~rearrange(mask, "b j -> b 1 1 j"), -torch.finfo(sim.dtype).max)
+            sim = sim.masked_fill(
+                ~rearrange(mask, "b j -> b 1 1 j"), -torch.finfo(sim.dtype).max
+            )
         if self.causal:
             sim = sim.masked_fill(
-                rearrange(self.get_causal_mask(sim.shape[-1], sim.device), "i j -> 1 1 i j"),
+                rearrange(
+                    self.get_causal_mask(sim.shape[-1], sim.device), "i j -> 1 1 i j"
+                ),
                 -torch.finfo(sim.dtype).max,
             )
         return drive, sim.softmax(dim=-1)
@@ -287,7 +288,9 @@ class SpinModelTransformerModule(nn.Module):
     # Relaxation
     #
 
-    def settle(self, start: Tensor, drive: Tensor, couplings: Tensor) -> tuple[Tensor, Tensor]:
+    def settle(
+        self, start: Tensor, drive: Tensor, couplings: Tensor
+    ) -> tuple[Tensor, Tensor]:
         """Relax to the horizon set by ``num_steps``, returning the last two iterates.
 
         The previous iterate is kept because the delayed correlations that feed
@@ -295,14 +298,18 @@ class SpinModelTransformerModule(nn.Module):
         two coincide, which is exactly the steady-state expression.
 
         The fixed-point branch solves without grad and then re-attaches an
-        exact implicit gradient.  Backpropagating through the solver would store
+        exact implicit gradient. Backpropagating through the solver would store
         every iterate and differentiate the path rather than the solution, and
         Anderson's ring buffer is written in place besides.
         """
-        step_fn = partial(mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta)
+        step_fn = partial(
+            mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta
+        )
         if self.num_steps is None:
             with torch.no_grad():
-                solved = mf.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
+                solved = mf.anderson(
+                    step_fn, start, max_iter=self.max_iter, tol=self.tol
+                )
             settled = mf.implicit_grad(step_fn, solved, max_iter=self.max_iter)
             return settled, settled
         trajectory = mf.relax_large_d(
@@ -313,16 +320,21 @@ class SpinModelTransformerModule(nn.Module):
     def forward(
         self, x: Tensor, state: MeanFieldState | None = None, mask: Tensor | None = None
     ) -> Readout:
+        x = self.pre_mix(x)
         normalized = self.normalize(x)
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
-        settled, previous = self.settle(self.initial(normalized, state), drive, couplings)
+        settled, previous = self.settle(
+            self.initial(normalized, state), drive, couplings
+        )
 
         entropy_production = None
         if self.measure_entropy_production:
             field = mf.effective_field(settled, drive, couplings)
             previous_field = mf.effective_field(previous, drive, couplings)
             entropy_production = proxies.housekeeping_entropy_production(
-                couplings, mf.covariance_traces_large_d(field, previous_field, self.beta), self.beta
+                couplings,
+                mf.covariance_traces_large_d(field, previous_field, self.beta),
+                self.beta,
             )
 
         # The returned state is not detached: truncating the history is the
@@ -346,7 +358,7 @@ class SpinModelTransformerModule(nn.Module):
         Always plain step-by-step iteration ``m_{k+1} = phi(x + J m_k)``, never
         the accelerated solver: here the path is the object of study, and
         Anderson's iterates are solver states that do not correspond to any
-        physical k.  The fixed point the mismatch is measured against is solved
+        physical k. The fixed point the mismatch is measured against is solved
         separately, so this reports the approach to the steady state even when
         the module itself runs at finite K and never computes one.
         """
@@ -354,8 +366,12 @@ class SpinModelTransformerModule(nn.Module):
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
         start = self.initial(normalized, state)
 
-        trajectory = mf.relax_large_d(start, drive, couplings, self.beta, num_steps=num_steps)
-        step_fn = partial(mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta)
+        trajectory = mf.relax_large_d(
+            start, drive, couplings, self.beta, num_steps=num_steps
+        )
+        step_fn = partial(
+            mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta
+        )
         steady = mf.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
 
         fields = mf.effective_field(trajectory, drive, couplings)

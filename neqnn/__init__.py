@@ -1,4 +1,4 @@
-from neqnn import data, mean_field, proxies, stochastic, vmf
+from neqnn import grad, mean_field, modules, proxies, stochastic, vmf
 from neqnn.modules import (
     MeanFieldState,
     Readout,
@@ -13,8 +13,9 @@ __all__ = [
     "Relaxation",
     "SpinModelTransformerModule",
     "advance",
-    "data",
+    "grad",
     "mean_field",
+    "modules",
     "proxies",
     "stochastic",
     "vmf",

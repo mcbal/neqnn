@@ -22,8 +22,6 @@ import numpy as np
 import torch
 from torch import Tensor
 
-TINY = 1e-30
-
 
 def radius(dim: int) -> float:
     """Spin radius R, fixed by the convention R^2 = D/2 - 1."""
@@ -116,7 +114,7 @@ def response(field: Tensor, beta: float) -> Tensor:
     dim = field.shape[-1]
     norm = field.norm(dim=-1, keepdim=True)
     amplitude = radius(dim) * mean_resultant(beta * radius(dim) * norm, dim)
-    return amplitude * field / norm.clamp_min(TINY)
+    return amplitude * field / norm.clamp_min(torch.finfo(norm.dtype).tiny)
 
 
 def response_large_d(field: Tensor, beta: float) -> Tensor:
@@ -139,7 +137,7 @@ def variances(field: Tensor, beta: float) -> tuple[Tensor, Tensor]:
     ratio = torch.where(
         kappa < 1e-6,
         torch.full_like(kappa, 1.0 / dim),
-        resultant / kappa.clamp_min(TINY),
+        resultant / kappa.clamp_min(torch.finfo(kappa.dtype).tiny),
     )
     tangential = r2 * ratio
     radial = r2 * (1 - (dim - 1) * ratio - resultant**2)
@@ -161,10 +159,15 @@ def _covariance_from_variances(
     field: Tensor, tangential: Tensor, radial: Tensor
 ) -> Tensor:
     dim = field.shape[-1]
-    direction = field / field.norm(dim=-1, keepdim=True).clamp_min(TINY)
+    direction = field / field.norm(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(effective_field.dtype).tiny
+    )
     eye = torch.eye(dim, dtype=field.dtype, device=field.device)
     outer = direction.unsqueeze(-1) * direction.unsqueeze(-2)
-    return tangential[..., None, None] * eye + (radial - tangential)[..., None, None] * outer
+    return (
+        tangential[..., None, None] * eye
+        + (radial - tangential)[..., None, None] * outer
+    )
 
 
 def covariance(field: Tensor, beta: float) -> Tensor:
@@ -206,9 +209,10 @@ def kl_large_d(field_p: Tensor, field_q: Tensor, beta: float) -> Tensor:
     m_p, m_q = response_large_d(field_p, beta), response_large_d(field_q, beta)
     norm_p, norm_q = m_p.pow(2).sum(-1), m_q.pow(2).sum(-1)
     slack = r2 - norm_q
-    return r2 * torch.log(slack / (r2 - norm_p)) + 2 * r2 * (
-        norm_q - (m_p * m_q).sum(-1)
-    ) / slack
+    return (
+        r2 * torch.log(slack / (r2 - norm_p))
+        + 2 * r2 * (norm_q - (m_p * m_q).sum(-1)) / slack
+    )
 
 
 #
@@ -246,9 +250,12 @@ def sample(mean_direction: Tensor, kappa: Tensor) -> Tensor:
     while pending.any():
         z = beta_dist.sample((int(pending.sum()),))
         proposal = (1 - (1 + b[pending]) * z) / (1 - (1 - b[pending]) * z)
-        accept = kappa[pending] * proposal + dm1 * torch.log1p(
-            -x0[pending] * proposal
-        ) - c[pending] >= torch.rand(z.shape, **kwargs).log()
+        accept = (
+            kappa[pending] * proposal
+            + dm1 * torch.log1p(-x0[pending] * proposal)
+            - c[pending]
+            >= torch.rand(z.shape, **kwargs).log()
+        )
         index = pending.nonzero(as_tuple=True)[0]
         w[index[accept]] = proposal[accept]
         pending[index[accept]] = False
@@ -266,7 +273,10 @@ def sample(mean_direction: Tensor, kappa: Tensor) -> Tensor:
     denom = reflection.pow(2).sum(-1, keepdim=True)
     projected = (reflection * canonical).sum(-1, keepdim=True)
     rotated = torch.where(
-        denom > 1e-28, canonical - 2 * reflection * projected / denom.clamp_min(TINY), canonical
+        denom > 1e-28,
+        canonical
+        - 2 * reflection * projected / denom.clamp_min(torch.finfo(denom.dtype).tiny),
+        canonical,
     )
     return rotated.reshape(*shape, dim)
 
@@ -274,6 +284,6 @@ def sample(mean_direction: Tensor, kappa: Tensor) -> Tensor:
 def sample_from_field(field: Tensor, beta: float) -> Tensor:
     """Draw scaled spins ``s = R u`` for sites sitting in effective field ``h``."""
     norm = field.norm(dim=-1, keepdim=True)
-    direction = field / norm.clamp_min(TINY)
+    direction = field / norm.clamp_min(torch.finfo(norm.dtype).tiny)
     r = radius(field.shape[-1])
     return r * sample(direction, beta * r * norm.squeeze(-1))
