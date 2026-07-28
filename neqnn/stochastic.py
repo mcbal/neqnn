@@ -156,6 +156,92 @@ class Estimates(NamedTuple):
     chain_magnetizations: Tensor  # (N,)
 
 
+class ReplicateEstimates(NamedTuple):
+    """Independent stationary estimates, retaining a leading replicate axis.
+
+    This is the lightweight route for Monte Carlo error bars.  It deliberately
+    omits the per-site ``D x D`` covariance matrices: experiments comparing
+    magnetizations and delayed correlations do not consume them, and forming
+    them can cost as much as the dynamics themselves.
+    """
+
+    magnetizations: Tensor  # (R, N, D)
+    delayed_correlations: Tensor  # (R, N, N)
+    chain_magnetizations: Tensor  # (R, N)
+
+
+def estimate_replicates(
+    drive: Tensor,
+    couplings: Tensor,
+    beta: float,
+    *,
+    num_repeats: int,
+    num_chains: int,
+    num_steps: int,
+    burn_in: int,
+) -> ReplicateEstimates:
+    """Stream several independent estimates together without unused moments.
+
+    Replicates and chains are statistically independent axes.  Advancing them
+    in one tensor removes repeated Python dispatch and gives the matrix
+    multiplications enough batch work to run efficiently, while retaining each
+    replicate for cross-replicate bias correction.
+    """
+    _validate_simulation(
+        drive,
+        couplings,
+        beta,
+        num_chains=num_chains,
+        num_steps=num_steps,
+        burn_in=burn_in,
+        estimate=True,
+    )
+    if (
+        not isinstance(num_repeats, int)
+        or isinstance(num_repeats, bool)
+        or num_repeats < 1
+    ):
+        raise ValueError(
+            f"num_repeats must be a positive integer, got {num_repeats!r}"
+        )
+
+    sites, dim = drive.shape
+    kwargs = dict(dtype=drive.dtype, device=drive.device)
+    state = random_state((num_repeats, num_chains, sites), dim, **kwargs)
+    for _ in range(burn_in):
+        state = step(state, drive, couplings, beta)
+
+    total = torch.zeros(num_repeats, sites, dim, **kwargs)
+    lagged = torch.zeros(num_repeats, sites, sites, **kwargs)
+    chain_total = torch.zeros(
+        num_repeats, num_chains, sites, dim, **kwargs
+    )
+    for index in range(num_steps):
+        previous, state = state, step(state, drive, couplings, beta)
+        total += state.sum(1)
+        chain_total += state
+        if index:
+            lagged += einsum(
+                state,
+                previous,
+                "r c i d, r c j d -> r i j",
+            )
+
+    count = num_steps * num_chains
+    magnetizations = total / count
+    delayed = lagged / ((num_steps - 1) * num_chains) - einsum(
+        magnetizations,
+        magnetizations,
+        "r i d, r j d -> r i j",
+    )
+    chain_means = chain_total / num_steps
+    return ReplicateEstimates(
+        magnetizations=magnetizations,
+        delayed_correlations=delayed,
+        chain_magnetizations=chain_means.norm(dim=-1).mean(1),
+    )
+
+
 def estimate(
     drive: Tensor,
     couplings: Tensor,

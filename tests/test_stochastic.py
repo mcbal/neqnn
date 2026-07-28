@@ -28,6 +28,39 @@ def test_streaming_estimates_match_the_stored_trajectory():
     assert relative(streamed.standard_error, stochastic.standard_error(states)) < 1e-12
 
 
+def test_lightweight_replicate_estimate_matches_single_stream():
+    dim, sites, beta = 12, 5, 1.5
+    drive, couplings = random_problem(dim, sites)
+    settings = dict(num_chains=8, num_steps=20, burn_in=5)
+
+    torch.manual_seed(11)
+    expected = stochastic.estimate(drive, couplings, beta, **settings)
+    torch.manual_seed(11)
+    actual = stochastic.estimate_replicates(
+        drive,
+        couplings,
+        beta,
+        num_repeats=1,
+        **settings,
+    )
+
+    assert relative(actual.magnetizations[0], expected.magnetizations) < 1e-12
+    assert (
+        relative(
+            actual.delayed_correlations[0],
+            expected.delayed_correlations,
+        )
+        < 1e-12
+    )
+    assert (
+        relative(
+            actual.chain_magnetizations[0],
+            expected.chain_magnetizations,
+        )
+        < 1e-12
+    )
+
+
 def test_transition_logp_is_a_normalized_density():
     """The dropped constant is exactly the uniform density, so exp(logp) is a ratio.
 
@@ -83,6 +116,20 @@ def test_estimate_rejects_invalid_sampling_budget(overrides, message):
     settings.update(overrides)
     with pytest.raises(ValueError, match=message):
         stochastic.estimate(**settings)
+
+
+def test_replicate_estimate_rejects_invalid_repeat_count():
+    drive, couplings = random_problem(8, 2)
+    with pytest.raises(ValueError, match="num_repeats"):
+        stochastic.estimate_replicates(
+            drive,
+            couplings,
+            1.0,
+            num_repeats=0,
+            num_chains=2,
+            num_steps=2,
+            burn_in=0,
+        )
 
 
 def test_simulation_validates_problem_shapes():
