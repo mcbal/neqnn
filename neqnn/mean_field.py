@@ -137,12 +137,29 @@ def contraction_factor_large_d(couplings: Tensor, beta: float) -> float:
 def covariance_traces(field: Tensor, previous_field: Tensor, beta: float) -> Tensor:
     """C*_ij = Tr(Sigma_i Sigma_j) from exact vMF covariances, shape (..., N, N).
 
-    Costs O(N^2 D^2) by contracting the covariance matrices directly, which is
-    fine for reference work but is why the large-D version below exists.
+    The exact vMF covariance is isotropic plus rank one,
+    ``Sigma = tau I + (rho - tau) mu mu^T``. Expanding that structure before
+    taking the pairwise traces costs O(N^2 D), without constructing any D x D
+    covariance matrices.
     """
-    later = vmf.covariance(field, beta)
-    earlier = vmf.covariance(previous_field, beta)
-    return einsum(later, earlier, "... i d e, ... j e d -> ... i j")
+    dim = field.shape[-1]
+    tau1, rho1 = vmf.variances(field, beta)
+    tau0, rho0 = vmf.variances(previous_field, beta)
+    delta1, delta0 = rho1 - tau1, rho0 - tau0
+    tiny = torch.finfo(field.dtype).tiny
+    direction1 = field / field.norm(dim=-1, keepdim=True).clamp_min(tiny)
+    direction0 = previous_field / previous_field.norm(
+        dim=-1, keepdim=True
+    ).clamp_min(tiny)
+    gram = einsum(direction1, direction0, "... i d, ... j d -> ... i j")
+    row = lambda t: rearrange(t, "... i -> ... i 1")
+    col = lambda t: rearrange(t, "... j -> ... 1 j")
+    return (
+        dim * row(tau1) * col(tau0)
+        + row(tau1) * col(delta0)
+        + row(delta1) * col(tau0)
+        + row(delta1) * col(delta0) * gram**2
+    )
 
 
 def covariance_traces_large_d(

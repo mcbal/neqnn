@@ -42,6 +42,82 @@ def test_magnetizations_respect_the_head_radius():
     assert float(state.detach().norm(dim=-1).max()) <= module.radius_head + 1e-9
 
 
+@pytest.mark.parametrize("beta", [0.5, 1.0, 2.0])
+def test_conjugate_carrier_is_an_exact_one_step_identity(beta):
+    dim, num_heads = 32, 4
+    module = SpinModelTransformerModule(
+        dim=dim,
+        num_heads=num_heads,
+        num_steps=1,
+        init="reset",
+        input_mode="magnetization",
+        beta=beta,
+        causal=True,
+        ffn=False,
+    ).double()
+    per_head = torch.nn.functional.normalize(
+        torch.randn(2, num_heads, 5, dim // num_heads, dtype=torch.float64), dim=-1
+    )
+    per_head = 0.6 * module.radius_head * per_head
+    x = module.merge_heads(per_head).detach().requires_grad_()
+
+    readout = module(x, probe=True)
+    assert torch.allclose(readout.magnetizations, x, rtol=1e-12, atol=1e-12)
+    assert torch.allclose(
+        readout.probe.drive,
+        vmf.inverse_response_large_d(per_head, beta),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    cotangent = torch.randn_like(readout.magnetizations)
+    input_gradient = torch.autograd.grad(
+        readout.magnetizations, x, grad_outputs=cotangent
+    )[0]
+    assert torch.allclose(input_gradient, cotangent, rtol=1e-11, atol=1e-11)
+
+
+def test_idle_conjugate_stack_preserves_signal_and_gradient_at_depth():
+    dim, depth = 16, 64
+    modules = torch.nn.ModuleList(
+        SpinModelTransformerModule(
+            dim=dim,
+            num_steps=1,
+            init="reset",
+            input_mode="magnetization",
+            beta=1.0,
+            ffn=False,
+        ).double()
+        for _ in range(depth)
+    )
+    x = torch.nn.functional.normalize(
+        torch.randn(1, 3, dim, dtype=torch.float64), dim=-1
+    )
+    x = (0.5 * modules[0].radius_head * x).detach().requires_grad_()
+    carried = x
+    for module in modules:
+        carried = module(carried).magnetizations
+
+    assert torch.allclose(carried, x, rtol=1e-11, atol=1e-11)
+    cotangent = torch.randn_like(carried)
+    input_gradient = torch.autograd.grad(carried, x, grad_outputs=cotangent)[0]
+    assert torch.allclose(input_gradient, cotangent, rtol=1e-10, atol=1e-10)
+
+
+def test_conjugate_carrier_rejects_boundary_magnetizations():
+    module = SpinModelTransformerModule(
+        dim=16,
+        num_steps=1,
+        init="reset",
+        input_mode="magnetization",
+        ffn=False,
+    )
+    x = torch.zeros(1, 2, 16)
+    x[..., 0] = module.radius_head
+    with pytest.raises(ValueError, match="strictly inside"):
+        module(x)
+
+
 def test_amortized_initializer_respects_the_head_radius():
     module = SpinModelTransformerModule(
         dim=128, num_heads=8, num_steps=1, init="amortized"
@@ -222,6 +298,8 @@ def test_fixed_point_non_convergence_is_loud_and_attached():
         {"dim": 0},
         {"dim": 64, "num_heads": 0},
         {"dim": 64, "init": "typo"},
+        {"dim": 64, "input_mode": "typo"},
+        {"dim": 64, "input_mode": "magnetization", "pre_mix": True},
         {"dim": 64, "num_steps": 0},
         {"dim": 64, "beta": 0},
         {"dim": 64, "max_iter": 1},

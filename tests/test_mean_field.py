@@ -63,6 +63,25 @@ def test_covariance_traces_large_d_matches_direct_contraction():
     )
 
 
+def test_covariance_traces_exact_matches_direct_contraction():
+    """The rank-one shortcut handles batches and zero fields exactly."""
+    dim, beta = 16, 1.3
+    field, _ = random_problem(dim)
+    other = stochastic.random_state((8,), dim)
+    field = torch.stack((field, field.clone()))
+    other = torch.stack((other, other.clone()))
+    field[0, 0] = 0
+    other[1, 0] = 0
+    direct = torch.einsum(
+        "...ide,...jed->...ij",
+        vmf.covariance(field, beta),
+        vmf.covariance(other, beta),
+    )
+    assert torch.allclose(
+        mf.covariance_traces(field, other, beta), direct, rtol=1e-10, atol=1e-12
+    )
+
+
 def test_mean_field_reproduces_the_chain_at_weak_coupling():
     dim, sites, beta = 64, 8, 1.0
     drive, couplings = random_problem(dim, sites, seed=3)

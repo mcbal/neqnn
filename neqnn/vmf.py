@@ -132,6 +132,38 @@ def response_large_d(field: Tensor, beta: float) -> Tensor:
     return beta * field / (1 + gamma(field, beta))
 
 
+def inverse_response_large_d(magnetization: Tensor, beta: float) -> Tensor:
+    """Conjugate field whose large-D response is ``magnetization``.
+
+    The large-D response is a bijection from finite fields to the open ball
+    ``||m|| < R``.  Its analytic inverse is
+
+    ``h(m) = 2 m / (beta (1 - ||m||^2 / R^2))``.
+
+    Boundary magnetizations require an infinite field and values outside the
+    ball are not physical means, so both are rejected rather than silently
+    clamped.  Keeping that failure explicit also prevents a token embedding on
+    the microscopic spin sphere from being mistaken for a magnetization.
+    """
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError(f"beta must be finite and positive, got {beta}")
+    if not magnetization.is_floating_point():
+        raise TypeError(
+            f"magnetization must be floating point, got {magnetization.dtype}"
+        )
+    if not bool(torch.isfinite(magnetization).all()):
+        raise ValueError("magnetization must contain only finite values")
+    relative_norm_squared = magnetization.pow(2).sum(-1, keepdim=True) / order(
+        magnetization.shape[-1]
+    )
+    if bool((relative_norm_squared >= 1).any()):
+        raise ValueError(
+            "inverse large-D response requires magnetizations strictly inside "
+            "the radius-R ball"
+        )
+    return (2 / beta) * magnetization / (1 - relative_norm_squared)
+
+
 def magnetization_squash(value: Tensor) -> Tensor:
     """Smoothly map an unconstrained value into the physical magnetization ball.
 

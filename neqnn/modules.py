@@ -19,6 +19,14 @@ State is explicit: ``forward`` takes the previous state and returns the next one
 rather than mutating anything, so which quadrant is running is the caller's
 choice and batching stays honest.
 
+The input coordinate is explicit too.  ``input_mode="field"`` preserves the
+original interface, where the incoming tensor contributes directly to the
+external drive.  ``input_mode="magnetization"`` treats each input head as an
+interior mean parameter and first lifts it to its conjugate field through the
+inverse large-D response.  With no additional field and a reset initializer, a
+one-step module in the latter mode is exactly the identity, including its input
+Jacobian.
+
 A note on ``post_mix``.  Mixing head outputs is what a transformer does, but
 here the outputs *are* magnetizations, and a linear map of them is no longer the
 magnetization of anything -- it has left the mean-field state space.  So it is
@@ -112,7 +120,7 @@ class Probe(NamedTuple):
     """
 
     x: Tensor  # the input stream, split into heads
-    drive: Tensor  # x + f_FFN(norm(x))
+    drive: Tensor  # carrier field + f_FFN(norm(x))
     couplings: Tensor  # J(norm(x)), (b, heads, n, n)
     initial: Tensor  # M_{t,0}, the initialization the relaxation started from
 
@@ -159,6 +167,7 @@ class SpinModelTransformerModule(nn.Module):
         num_heads: int = 1,
         num_steps: int | None = 1,
         init: Literal["reset", "amortized", "carried"] = "amortized",
+        input_mode: Literal["field", "magnetization"] = "field",
         beta: float = 1.0,
         causal: bool = False,
         max_iter: int = 40,
@@ -196,6 +205,11 @@ class SpinModelTransformerModule(nn.Module):
                 "init must be one of 'reset', 'amortized', or 'carried', "
                 f"got {init!r}"
             )
+        if input_mode not in {"field", "magnetization"}:
+            raise ValueError(
+                "input_mode must be either 'field' or 'magnetization', "
+                f"got {input_mode!r}"
+            )
         if num_steps is not None and (
             not isinstance(num_steps, int)
             or isinstance(num_steps, bool)
@@ -222,6 +236,11 @@ class SpinModelTransformerModule(nn.Module):
             raise ValueError(
                 f"rope requires an even head dimension, got {dim_head}"
             )
+        if input_mode == "magnetization" and pre_mix:
+            raise ValueError(
+                "pre_mix is not supported for magnetization inputs because its "
+                "unconstrained linear map does not preserve the physical ball"
+            )
 
         self.dim = dim
         self.dim_head = dim_head
@@ -230,6 +249,7 @@ class SpinModelTransformerModule(nn.Module):
 
         self.num_steps = num_steps
         self.init = init
+        self.input_mode = input_mode
         self.beta = beta
         self.causal = causal
         self.qk_norm = qk_norm
@@ -335,7 +355,12 @@ class SpinModelTransformerModule(nn.Module):
     def drive_and_couplings(
         self, x: Tensor, mask: Tensor | None, *, normalized: Tensor | None = None
     ) -> tuple[Tensor, Tensor]:
-        """The field ``x + f_FFN(norm(x))`` and coupling rule ``J(norm(x))``.
+        """The carrier plus learned field and coupling rule ``J(norm(x))``.
+
+        Field inputs contribute ``x`` directly. Magnetization inputs contribute
+        ``phi_beta_inverse(x)`` instead, cancelling the response's shrinking
+        Jacobian on the otherwise idle one-step path. In both cases the FFN is
+        an additive physical field increment.
 
         With ``qk_norm`` the logit is ``temperature * cos(q, k)``. The positive
         learned temperature starts at ``sqrt(D_head)``; query and key magnitude
@@ -348,7 +373,14 @@ class SpinModelTransformerModule(nn.Module):
         """
         normalized = self.normalize(x) if normalized is None else normalized
         queries, keys = self.to_qk(normalized).chunk(2, dim=-1)
-        drive = self.split_heads(x if self.ffn is None else x + self.ffn(normalized))
+        carrier = self.split_heads(x)
+        if self.input_mode == "magnetization":
+            carrier = vmf.inverse_response_large_d(carrier, self.beta)
+        drive = (
+            carrier
+            if self.ffn is None
+            else carrier + self.split_heads(self.ffn(normalized))
+        )
         queries, keys = map(self.split_heads, (queries, keys))
 
         if self.qk_norm:

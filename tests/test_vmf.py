@@ -96,6 +96,36 @@ def test_magnetization_squash_is_bounded_and_locally_identity():
         )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("beta", [0.5, 1.0, 2.0])
+def test_inverse_large_d_response_round_trips_the_open_ball(dtype, beta):
+    dim = 32
+    direction = torch.nn.functional.normalize(
+        torch.randn(5, dim, dtype=dtype), dim=-1
+    )
+    fractions = torch.tensor([0.0, 0.1, 0.5, 0.9, 0.999], dtype=dtype)
+    magnetization = direction * (fractions * vmf.radius(dim))[:, None]
+    field = vmf.inverse_response_large_d(magnetization, beta)
+    recovered = vmf.response_large_d(field, beta)
+    tolerance = 3e-5 if dtype == torch.float32 else 1e-11
+    assert torch.allclose(recovered, magnetization, rtol=tolerance, atol=tolerance)
+
+
+def test_inverse_large_d_response_rejects_nonphysical_inputs():
+    dim = 32
+    boundary = torch.zeros(2, dim)
+    boundary[0, 0] = vmf.radius(dim)
+    boundary[1, 0] = 1.01 * vmf.radius(dim)
+    with pytest.raises(ValueError, match="strictly inside"):
+        vmf.inverse_response_large_d(boundary, 1.0)
+    with pytest.raises(ValueError, match="finite values"):
+        vmf.inverse_response_large_d(torch.full((1, dim), torch.nan), 1.0)
+    with pytest.raises(TypeError, match="floating point"):
+        vmf.inverse_response_large_d(torch.ones(1, dim, dtype=torch.int64), 1.0)
+    with pytest.raises(ValueError, match="finite and positive"):
+        vmf.inverse_response_large_d(torch.zeros(1, dim), 0.0)
+
+
 @pytest.mark.parametrize("quantity", ["response", "covariance", "kl"])
 def test_large_d_forms_converge_as_one_over_dim(quantity):
     beta = 1.0
