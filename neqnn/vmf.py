@@ -132,6 +132,18 @@ def response_large_d(field: Tensor, beta: float) -> Tensor:
     return beta * field / (1 + gamma(field, beta))
 
 
+def magnetization_squash(value: Tensor) -> Tensor:
+    """Smoothly map an unconstrained value into the physical magnetization ball.
+
+    This is ``response_large_d(2 * value / beta, beta)`` with beta cancelled.
+    The factor two compensates the response's beta/2 slope at zero, so the map
+    is locally the identity while its norm approaches R for large inputs.
+    """
+    r2 = order(value.shape[-1])
+    scale = 2 / (1 + torch.sqrt(1 + 4 * value.pow(2).sum(-1, keepdim=True) / r2))
+    return scale * value
+
+
 def variances(field: Tensor, beta: float) -> tuple[Tensor, Tensor]:
     """Tangential and radial variances of a single spin.
 
