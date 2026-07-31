@@ -135,7 +135,14 @@ class Readout(NamedTuple):
 
 
 class Relaxation(NamedTuple):
-    """Diagnostics along the relaxation at frozen drive, leading axis k."""
+    """Diagnostics along the relaxation at frozen drive.
+
+    ``magnetizations[k]`` is the state m_k, including the initializer at k=0.
+    ``mismatch[k]`` is evaluated at that state through its update field h(m_k);
+    the vMF law induced by this field has mean m_{k+1}. ``entropy_production[k]``
+    and ``residual[k]`` belong to the transition m_k -> m_{k+1}, so they have
+    one fewer entry than the state and mismatch trajectories.
+    """
 
     magnetizations: Tensor
     mismatch: Tensor
@@ -388,7 +395,8 @@ class SpinModelTransformerModule(nn.Module):
         - ``reset``     unmagnetized, M = 0.  The trivial start: carries nothing
           from the drive and nothing from history, so it is the control the
           other two are read against.
-        - ``amortized`` M = X_t W_V, a learned guess at where relaxation ends up.
+        - ``amortized`` M = squash(X_t W_V), a learned physical guess at where
+          relaxation ends up.
         - ``carried``   M = M_{t-1,K} from the previous drive step, falling back
           to the amortized guess when there is no history, so the reset and
           carried columns differ only from t=1 on.
@@ -397,7 +405,7 @@ class SpinModelTransformerModule(nn.Module):
             return self.split_heads(torch.zeros_like(x))
         if self.init == "carried" and state is not None:
             return state.magnetizations
-        return self.split_heads(self.to_v(x))
+        return vmf.magnetization_squash(self.split_heads(self.to_v(x)))
 
     #
     # Relaxation
@@ -546,6 +554,8 @@ class SpinModelTransformerModule(nn.Module):
         state: MeanFieldState | None = None,
         mask: Tensor | None = None,
         num_steps: int = 64,
+        start: Tensor | None = None,
+        reference: Tensor | None = None,
     ) -> Relaxation:
         """Trace the relaxation at frozen drive, for probing rather than for output.
 
@@ -555,12 +565,26 @@ class SpinModelTransformerModule(nn.Module):
         physical k. The fixed point the mismatch is measured against is solved
         separately, so this reports the approach to the steady state even when
         the module itself runs at finite K and never computes one.
+
+        ``start`` overrides the module's initializer for counterfactual paths.
+        ``reference`` reuses a fixed-point tensor, letting several paths be
+        compared against exactly the same target under the current dynamics.
         """
         self._validate_inputs(x, state, mask)
+        expected = (x.shape[0], self.num_heads, x.shape[1], self.dim_head)
+        for name, value in (("start", start), ("reference", reference)):
+            if value is not None and tuple(value.shape) != expected:
+                raise ValueError(
+                    f"{name} must have shape {expected}, got {tuple(value.shape)}"
+                )
+            if value is not None and (
+                value.dtype != x.dtype or value.device != x.device
+            ):
+                raise ValueError(f"{name} must share x's dtype and device")
         x = self.pre_mix(x)
         normalized = self.normalize(x)
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
-        start = self.initial(normalized, state)
+        start = self.initial(normalized, state) if start is None else start
 
         trajectory = mf.relax_large_d(
             start, drive, couplings, self.beta, num_steps=num_steps
@@ -568,9 +592,13 @@ class SpinModelTransformerModule(nn.Module):
         step_fn = partial(
             mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta
         )
-        solve = fp.anderson(
-            step_fn, start, max_iter=self.max_iter, tol=self.tol
-        )
+        if reference is None:
+            solve = fp.anderson(
+                step_fn, start, max_iter=self.max_iter, tol=self.tol
+            )
+        else:
+            residual = fp.residual(step_fn(reference), reference)
+            solve = fp.Solve(reference, residual, residual < self.tol)
         if not solve.converged:
             warnings.warn(
                 f"diagnostic fixed-point residual {solve.residual:.2e} exceeds "

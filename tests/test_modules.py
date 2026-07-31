@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from neqnn import SpinModelTransformerModule, advance
+from neqnn import SpinModelTransformerModule, advance, mean_field as mf, proxies, vmf
 
 
 @pytest.mark.parametrize("num_steps", [1, 4, None])
@@ -40,6 +40,17 @@ def test_magnetizations_respect_the_head_radius():
     )
     state = module(torch.randn(2, 16, dim)).state.magnetizations
     assert float(state.detach().norm(dim=-1).max()) <= module.radius_head + 1e-9
+
+
+def test_amortized_initializer_respects_the_head_radius():
+    module = SpinModelTransformerModule(
+        dim=128, num_heads=8, num_steps=1, init="amortized"
+    )
+    with torch.no_grad():
+        module.to_v.weight.mul_(1e4)
+    normalized = module.normalize(torch.randn(2, 16, 128))
+    initial = module.initial(normalized, None)
+    assert float(initial.detach().norm(dim=-1).max()) < module.radius_head
 
 
 def test_probe_returns_the_ingredients_of_the_same_pass():
@@ -130,19 +141,65 @@ def test_post_mix_is_output_only():
     assert not torch.allclose(readout.output, readout.magnetizations)
 
 
-def test_relaxation_applies_pre_mix_like_forward():
+def test_relaxation_indices_match_the_forward_pass():
     module = SpinModelTransformerModule(
         dim=64,
         num_heads=2,
         num_steps=1,
         init="amortized",
+        causal=True,
+        qk_bias=True,
+        rope=True,
         pre_mix=True,
+        measure_entropy_production=True,
     )
     x = torch.randn(2, 8, 64)
-    readout = module(x)
+    readout = module(x, probe=True)
     trace = module.relaxation(x, num_steps=1)
-    assert torch.allclose(trace.magnetizations[-1], readout.state.magnetizations)
+    probe = readout.probe
+    assert probe is not None
+
+    # k=0 is the exact initializer used by forward; k=1 is its exact output.
+    assert torch.allclose(trace.magnetizations[0], probe.initial)
+    assert torch.allclose(trace.magnetizations[1], readout.state.magnetizations)
+    field_0 = mf.effective_field(
+        trace.magnetizations[0], probe.drive, probe.couplings
+    )
+    field_1 = mf.effective_field(
+        trace.magnetizations[1], probe.drive, probe.couplings
+    )
+    assert torch.allclose(
+        vmf.response_large_d(field_0, module.beta), trace.magnetizations[1]
+    )
+
+    # KL[k] is attached to h(m_k), while entropy[0] spans m_0 -> m_1.
+    steady_field = mf.effective_field(
+        trace.fixed_point.solution, probe.drive, probe.couplings
+    )
+    assert torch.allclose(
+        trace.mismatch,
+        proxies.mismatch(
+            torch.stack([field_0, field_1]), steady_field, module.beta
+        ),
+    )
+    assert torch.allclose(trace.entropy_production[0], readout.entropy_production)
     assert trace.fixed_point.converged
+
+    # A counterfactual start changes only the path and can reuse the exact target.
+    counter_start = torch.zeros_like(trace.magnetizations[0])
+    counter = module.relaxation(
+        x,
+        num_steps=1,
+        start=counter_start,
+        reference=trace.fixed_point.solution,
+    )
+    assert torch.allclose(counter.magnetizations[0], counter_start)
+    assert torch.allclose(counter.fixed_point.solution, trace.fixed_point.solution)
+    assert torch.allclose(
+        counter.magnetizations[1],
+        mf.step_large_d(counter_start, probe.drive, probe.couplings, module.beta),
+    )
+    assert counter.fixed_point.converged
 
 
 def test_fixed_point_non_convergence_is_loud_and_attached():
@@ -190,6 +247,13 @@ def test_forward_validates_mask_and_state():
         module(
             x,
             state=type(module(x).state)(magnetizations=torch.zeros(1, 2, 3, 32)),
+        )
+    with pytest.raises(ValueError, match="start must have shape"):
+        module.relaxation(x, start=torch.zeros(1, 2, 3, 32))
+    with pytest.raises(ValueError, match="reference must share"):
+        module.relaxation(
+            x,
+            reference=torch.zeros(1, 2, 4, 32, dtype=torch.float32),
         )
 
 
