@@ -84,6 +84,18 @@ def test_covariance_agrees_with_its_variances():
     assert torch.allclose(trace, radial + (dim - 1) * tangential)
 
 
+def test_magnetization_squash_is_bounded_and_locally_identity():
+    dim = 64
+    value = torch.randn(8, dim)
+    squashed = vmf.magnetization_squash(value)
+    assert float(squashed.norm(dim=-1).max()) < vmf.radius(dim)
+    assert relative(vmf.magnetization_squash(value * 1e-4), value * 1e-4) < 1e-7
+    for beta in (0.5, 1.0, 2.0):
+        assert torch.allclose(
+            squashed, vmf.response_large_d(2 * value / beta, beta)
+        )
+
+
 @pytest.mark.parametrize("quantity", ["response", "covariance", "kl"])
 def test_large_d_forms_converge_as_one_over_dim(quantity):
     beta = 1.0
