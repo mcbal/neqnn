@@ -24,11 +24,10 @@ dependencies = [
     "torch>=2.10.0",
 ]
 
+[project.optional-dependencies]
+webcam = ["opencv-python>=4.10"]
+
 [dependency-groups]
-# None of these are imported by the package itself.  scipy is a test-only
-# reference for the Bessel and normalizer routines -- which is the point, since
-# it underflows exactly where our recurrence has to keep working -- and
-# matplotlib serves only the experiment scripts.
 dev = ["matplotlib>=3.10.0", "pytest>=8.0", "scipy>=1.14"]
 
 [tool.hatch.metadata]

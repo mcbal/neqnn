@@ -1,9 +1,8 @@
 **/__pycache__
 *.egg-info/
-# Experiment caches are regenerable provenance-keyed .pt files; figures stay tracked.
-experiments/data/
 build/
 dist/
+node_modules/
 .venv/
 .DS_Store
 .python-version
