@@ -153,6 +153,34 @@ def test_probe_returns_the_ingredients_of_the_same_pass():
     assert torch.allclose(settled, readout.state.magnetizations)
 
 
+def test_external_drive_offset_nudges_relaxation_without_changing_features():
+    module = SpinModelTransformerModule(
+        dim=16,
+        num_steps=1,
+        init="reset",
+        beta=1.0,
+        ffn=False,
+    ).double()
+    x = torch.zeros(1, 3, 16, dtype=torch.float64)
+    offset = torch.zeros_like(x)
+    offset[:, 0, 0] = 0.75
+
+    baseline = module(x, probe=True)
+    nudged = module(x, probe=True, drive_offset=offset)
+
+    assert torch.allclose(baseline.magnetizations, torch.zeros_like(x))
+    assert torch.allclose(nudged.probe.x, baseline.probe.x)
+    assert torch.allclose(nudged.probe.couplings, baseline.probe.couplings)
+    assert torch.allclose(
+        nudged.probe.drive,
+        baseline.probe.drive + module.split_heads(offset),
+    )
+    assert torch.allclose(
+        module.split_heads(nudged.magnetizations),
+        vmf.response_large_d(nudged.probe.drive, module.beta),
+    )
+
+
 def test_one_step_from_reset_cannot_see_the_couplings():
     """m_0 = 0 kills the coupling term outright, so nothing routing-related learns."""
     module = SpinModelTransformerModule(dim=64, num_steps=1, init="reset", beta=1.0)
@@ -326,6 +354,10 @@ def test_forward_validates_mask_and_state():
             x,
             state=type(module(x).state)(magnetizations=torch.zeros(1, 2, 3, 32)),
         )
+    with pytest.raises(ValueError, match="same shape"):
+        module(x, drive_offset=torch.zeros(1, 3, 64))
+    with pytest.raises(TypeError, match="floating point"):
+        module(x, drive_offset=torch.zeros_like(x, dtype=torch.long))
     with pytest.raises(ValueError, match="start must have shape"):
         module.relaxation(x, start=torch.zeros(1, 2, 3, 32))
     with pytest.raises(ValueError, match="reference must share"):

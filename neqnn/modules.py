@@ -543,11 +543,31 @@ class SpinModelTransformerModule(nn.Module):
         mask: Tensor | None = None,
         *,
         probe: bool = False,
+        drive_offset: Tensor | None = None,
     ) -> Readout:
         self._validate_inputs(x, state, mask)
+        if drive_offset is not None:
+            if tuple(drive_offset.shape) != tuple(x.shape):
+                raise ValueError(
+                    "drive_offset must have the same shape as x, got "
+                    f"{tuple(drive_offset.shape)} instead of {tuple(x.shape)}"
+                )
+            if not drive_offset.is_floating_point():
+                raise TypeError(
+                    f"drive_offset must be floating point, got {drive_offset.dtype}"
+                )
+            if drive_offset.dtype != x.dtype or drive_offset.device != x.device:
+                raise ValueError(
+                    "drive_offset must share x's dtype and device"
+                )
         x = self.pre_mix(x)
         normalized = self.normalize(x)
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
+        if drive_offset is not None:
+            # Unlike ``x``, this is an external physical field: it changes the
+            # relaxation drive without changing Q/K/V features or the initial
+            # state.  This is useful for causal feedback or clamping phases.
+            drive = drive + self.split_heads(drive_offset)
         initial = self.initial(normalized, state)
         settled, previous, solve = self._settle_with_evidence(
             initial, drive, couplings
