@@ -7,10 +7,11 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
+DATA = ROOT / "outputs"
 FIGURES = ROOT / "figures"
-SURFACE, INK, MUTED = "#fbfaf7", "#171717", "#66635f"
-BLUE, ORANGE, GREEN = "#2374c6", "#e66b35", "#15936f"
+SURFACE, INK, MUTED = "#faf9f6", "#29313d", "#707783"
+BLUE, ORANGE, GREEN = "#6f9fc5", "#d89170", "#78a58f"
+PURPLE, GRID = "#9a8fbd", "#d9d7d1"
 
 
 def numbers(value: str, cast=float) -> list:
@@ -21,8 +22,11 @@ def numbers(value: str, cast=float) -> list:
 
 
 def save_data(payload: dict, path: Path) -> None:
+    """Atomically replace an experiment artifact after it is fully serialized."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    temporary = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
     print(f"saved {path}")
 
 
@@ -38,14 +42,31 @@ def style() -> None:
             "figure.facecolor": SURFACE,
             "axes.facecolor": SURFACE,
             "savefig.facecolor": SURFACE,
+            "font.family": "sans-serif",
+            "font.sans-serif": [
+                "Inter",
+                "Clear Sans",
+                "Avenir Next",
+                "Helvetica Neue",
+                "DejaVu Sans",
+            ],
             "font.size": 9,
             "axes.titlesize": 10,
+            "axes.titleweight": 500,
             "axes.spines.top": False,
             "axes.spines.right": False,
-            "axes.edgecolor": "#aaa6a0",
+            "axes.edgecolor": GRID,
             "axes.labelcolor": MUTED,
+            "axes.grid": True,
+            "axes.grid.axis": "y",
+            "axes.grid.which": "major",
+            "grid.color": GRID,
+            "grid.linewidth": 0.55,
+            "grid.alpha": 0.45,
             "xtick.color": MUTED,
             "ytick.color": MUTED,
+            "xtick.major.width": 0.6,
+            "ytick.major.width": 0.6,
             "legend.frameon": False,
             "figure.dpi": 140,
             "savefig.dpi": 220,
@@ -54,11 +75,12 @@ def style() -> None:
     )
 
 
-def save_figure(fig, name: str) -> None:
+def save_figure(fig, name: str, directory: Path | None = None) -> None:
     import matplotlib.pyplot as plt
 
-    FIGURES.mkdir(parents=True, exist_ok=True)
+    directory = FIGURES if directory is None else directory
+    directory.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "pdf"):
-        fig.savefig(FIGURES / f"{name}.{suffix}")
+        fig.savefig(directory / f"{name}.{suffix}")
     plt.close(fig)
-    print(f"saved figures/{name}.png")
+    print(f"saved {directory / f'{name}.png'}")
