@@ -1,6 +1,6 @@
 # Nonequilibrium dynamics in spin-model transformers
 
-Companion code and `neqnn` package for blog post [Nonequilibrium Dynamics in Spin-Model Transformers (2026)](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
+Companion code and package for blog post [Nonequilibrium Dynamics in Spin-Model Transformers (Bal, 2026)](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
 
 ## Getting started
 
