@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "outputs"
+OUTPUTS = ROOT / "outputs"
 FIGURES = ROOT / "figures"
 SURFACE, INK, MUTED = "#faf9f6", "#29313d", "#707783"
 BLUE, ORANGE, GREEN = "#6f9fc5", "#d89170", "#78a58f"

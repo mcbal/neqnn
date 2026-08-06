@@ -509,7 +509,7 @@ def plot(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=common.DATA / "fidelity.pt")
+    parser.add_argument("--input", type=Path, default=common.OUTPUTS / "fidelity.pt")
     parser.add_argument("--output-dir", type=Path, default=common.FIGURES)
     parser.add_argument("--prefix", default="fidelity")
     args = parser.parse_args()

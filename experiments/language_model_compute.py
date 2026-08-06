@@ -1,4 +1,4 @@
-"""Train small depth-swept spin language models on Dostoevsky."""
+"""Train small depth-swept spin-model language models on Dostoevsky."""
 
 from __future__ import annotations
 
@@ -145,9 +145,10 @@ class LanguageModel(nn.Module):
                 num_heads=heads,
                 num_steps=1,
                 init="learned",
-                # Token embeddings are physical fields.  Once the first module
-                # responds, subsequent layer inputs are magnetizations and may
-                # use the conjugate-field carrier.
+                # Token embeddings are physical fields that may lie outside the
+                # magnetization ball. Once the first module responds, subsequent
+                # layer inputs are magnetizations and so we can invert them and
+                # use the conjugate field as drive / residual.
                 input_mode="field" if layer_index == 0 else input_mode,
                 beta=1.0,
                 causal=True,
@@ -179,13 +180,13 @@ class LanguageModel(nn.Module):
             result = layer(x, probe=inspect)
             x = result.magnetizations
             if inspect:
-                x.retain_grad()
+                x.retain_grad()  # non-leaf tensor
                 for tensor in (
                     result.probe.drive,
                     result.probe.couplings,
                     result.probe.initial,
                 ):
-                    tensor.retain_grad()
+                    tensor.retain_grad()  # non-leaf tensor
                 activations.append(x)
                 probes.append(result.probe)
         return self.readout(x), activations, probes
@@ -362,7 +363,7 @@ def signals(model, activations, probes):
                 "entropy_fixed_point_converged": fixed_point.converged,
                 # One-step distributional change from the learned value guess
                 # m_0 to the module output m_1. Unlike the fixed-point mismatch
-                # used by Relaxation, this needs no additional solve.
+                # used by relaxation, this needs no additional solve.
                 "relaxation_mismatch": float(relaxation_mismatch.float().mean()),
             }
         )
@@ -1036,7 +1037,7 @@ def main() -> None:
         help="download source used only when --corpus does not exist; pass an empty value to disable",
     )
     parser.add_argument(
-        "--output", type=Path, default=common.DATA / "language_model.pt"
+        "--output", type=Path, default=common.OUTPUTS / "language_model.pt"
     )
     parser.add_argument("--depths", default="3,6,12,24")
     parser.add_argument("--steps", type=int, default=3000)

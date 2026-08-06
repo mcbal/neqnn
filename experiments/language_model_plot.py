@@ -1016,7 +1016,7 @@ def plot(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=common.DATA / "language_model.pt")
+    parser.add_argument("--input", type=Path, default=common.OUTPUTS / "language_model.pt")
     parser.add_argument("--output-dir", type=Path, default=common.FIGURES)
     parser.add_argument("--prefix", default="language_model")
     parser.add_argument("--no-gif", action="store_true")
