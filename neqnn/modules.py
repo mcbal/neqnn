@@ -189,9 +189,7 @@ class SpinModelTransformerModule(nn.Module):
             or isinstance(num_heads, bool)
             or num_heads <= 0
         ):
-            raise ValueError(
-                f"num_heads must be a positive integer, got {num_heads!r}"
-            )
+            raise ValueError(f"num_heads must be a positive integer, got {num_heads!r}")
         if dim % num_heads:
             raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
         dim_head = dim // num_heads
@@ -202,8 +200,7 @@ class SpinModelTransformerModule(nn.Module):
             )
         if init not in {"reset", "amortized", "carried"}:
             raise ValueError(
-                "init must be one of 'reset', 'amortized', or 'carried', "
-                f"got {init!r}"
+                f"init must be one of 'reset', 'amortized', or 'carried', got {init!r}"
             )
         if input_mode not in {"field", "magnetization"}:
             raise ValueError(
@@ -220,22 +217,14 @@ class SpinModelTransformerModule(nn.Module):
             )
         if not math.isfinite(beta) or beta <= 0:
             raise ValueError(f"beta must be finite and positive, got {beta}")
-        if (
-            not isinstance(max_iter, int)
-            or isinstance(max_iter, bool)
-            or max_iter < 2
-        ):
+        if not isinstance(max_iter, int) or isinstance(max_iter, bool) or max_iter < 2:
             raise ValueError(f"max_iter must be an integer >= 2, got {max_iter!r}")
         if not math.isfinite(tol) or tol <= 0:
             raise ValueError(f"tol must be finite and positive, got {tol}")
         if not math.isfinite(rope_base) or rope_base <= 0:
-            raise ValueError(
-                f"rope_base must be finite and positive, got {rope_base}"
-            )
+            raise ValueError(f"rope_base must be finite and positive, got {rope_base}")
         if rope and dim_head % 2:
-            raise ValueError(
-                f"rope requires an even head dimension, got {dim_head}"
-            )
+            raise ValueError(f"rope requires an even head dimension, got {dim_head}")
         if input_mode == "magnetization" and pre_mix:
             raise ValueError(
                 "pre_mix is not supported for magnetization inputs because its "
@@ -280,9 +269,7 @@ class SpinModelTransformerModule(nn.Module):
         # not something bounded by R. Its magnitude is used in the forward pass
         # so optimization cannot silently turn similarity attention into
         # anti-similarity attention.
-        self.attn_temperature = nn.Parameter(
-            torch.tensor(float(self.dim_head) ** 0.5)
-        )
+        self.attn_temperature = nn.Parameter(torch.tensor(float(self.dim_head) ** 0.5))
 
         # Disabling drops the memory term from the drive entirely.
         self.ffn = (
@@ -475,9 +462,7 @@ class SpinModelTransformerModule(nn.Module):
                     RuntimeWarning,
                     stacklevel=3,
                 )
-            settled = fp.implicit_grad(
-                step_fn, solve.solution, max_iter=self.max_iter
-            )
+            settled = fp.implicit_grad(step_fn, solve.solution, max_iter=self.max_iter)
             return settled, settled, solve
         previous, current = start, start
         for _ in range(self.num_steps):
@@ -488,9 +473,7 @@ class SpinModelTransformerModule(nn.Module):
         self, start: Tensor, drive: Tensor, couplings: Tensor
     ) -> tuple[Tensor, Tensor]:
         """Settle while preserving the historical two-tensor public interface."""
-        settled, previous, _ = self._settle_with_evidence(
-            start, drive, couplings
-        )
+        settled, previous, _ = self._settle_with_evidence(start, drive, couplings)
         return settled, previous
 
     def _validate_inputs(
@@ -534,9 +517,7 @@ class SpinModelTransformerModule(nn.Module):
                 state.magnetizations.dtype != x.dtype
                 or state.magnetizations.device != x.device
             ):
-                raise ValueError(
-                    "state magnetizations must share x's dtype and device"
-                )
+                raise ValueError("state magnetizations must share x's dtype and device")
 
     def forward(
         self,
@@ -559,9 +540,7 @@ class SpinModelTransformerModule(nn.Module):
                     f"drive_offset must be floating point, got {drive_offset.dtype}"
                 )
             if drive_offset.dtype != x.dtype or drive_offset.device != x.device:
-                raise ValueError(
-                    "drive_offset must share x's dtype and device"
-                )
+                raise ValueError("drive_offset must share x's dtype and device")
         x = self.pre_mix(x)
         normalized = self.normalize(x)
         drive, couplings = self.drive_and_couplings(x, mask, normalized=normalized)
@@ -571,9 +550,7 @@ class SpinModelTransformerModule(nn.Module):
             # state.  This is useful for causal feedback or clamping phases.
             drive = drive + self.split_heads(drive_offset)
         initial = self.initial(normalized, state)
-        settled, previous, solve = self._settle_with_evidence(
-            initial, drive, couplings
-        )
+        settled, previous, solve = self._settle_with_evidence(initial, drive, couplings)
 
         entropy_production = None
         if self.measure_entropy_production:
@@ -647,9 +624,7 @@ class SpinModelTransformerModule(nn.Module):
             mf.step_large_d, drive=drive, couplings=couplings, beta=self.beta
         )
         if reference is None:
-            solve = fp.anderson(
-                step_fn, start, max_iter=self.max_iter, tol=self.tol
-            )
+            solve = fp.anderson(step_fn, start, max_iter=self.max_iter, tol=self.tol)
         else:
             residual = fp.residual(step_fn(reference), reference)
             solve = fp.Solve(reference, residual, residual < self.tol)

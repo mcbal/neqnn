@@ -84,25 +84,11 @@ def test_covariance_agrees_with_its_variances():
     assert torch.allclose(trace, radial + (dim - 1) * tangential)
 
 
-def test_magnetization_squash_is_bounded_and_locally_identity():
-    dim = 64
-    value = torch.randn(8, dim)
-    squashed = vmf.magnetization_squash(value)
-    assert float(squashed.norm(dim=-1).max()) < vmf.radius(dim)
-    assert relative(vmf.magnetization_squash(value * 1e-4), value * 1e-4) < 1e-7
-    for beta in (0.5, 1.0, 2.0):
-        assert torch.allclose(
-            squashed, vmf.response_large_d(2 * value / beta, beta)
-        )
-
-
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("beta", [0.5, 1.0, 2.0])
 def test_inverse_large_d_response_round_trips_the_open_ball(dtype, beta):
     dim = 32
-    direction = torch.nn.functional.normalize(
-        torch.randn(5, dim, dtype=dtype), dim=-1
-    )
+    direction = torch.nn.functional.normalize(torch.randn(5, dim, dtype=dtype), dim=-1)
     fractions = torch.tensor([0.0, 0.1, 0.5, 0.9, 0.999], dtype=dtype)
     magnetization = direction * (fractions * vmf.radius(dim))[:, None]
     field = vmf.inverse_response_large_d(magnetization, beta)

@@ -113,6 +113,4 @@ def test_distinct_fixed_points_counts_branches_and_drops_unconverged():
     assert len(found) == 3
 
     # A start that cannot converge within the budget must not be counted.
-    assert (
-        fp.distinct_fixed_points(step_fn, [torch.full(shape, 0.7)], max_iter=3) == []
-    )
+    assert fp.distinct_fixed_points(step_fn, [torch.full(shape, 0.7)], max_iter=3) == []

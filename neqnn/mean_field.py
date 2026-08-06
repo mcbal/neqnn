@@ -148,9 +148,9 @@ def covariance_traces(field: Tensor, previous_field: Tensor, beta: float) -> Ten
     delta1, delta0 = rho1 - tau1, rho0 - tau0
     tiny = torch.finfo(field.dtype).tiny
     direction1 = field / field.norm(dim=-1, keepdim=True).clamp_min(tiny)
-    direction0 = previous_field / previous_field.norm(
-        dim=-1, keepdim=True
-    ).clamp_min(tiny)
+    direction0 = previous_field / previous_field.norm(dim=-1, keepdim=True).clamp_min(
+        tiny
+    )
     gram = einsum(direction1, direction0, "... i d, ... j d -> ... i j")
     row = lambda t: rearrange(t, "... i -> ... i 1")
     col = lambda t: rearrange(t, "... j -> ... 1 j")

@@ -71,11 +71,7 @@ def _validate_simulation(
         raise ValueError(
             f"num_steps must be an integer >= {minimum_steps}, got {num_steps!r}"
         )
-    if (
-        not isinstance(burn_in, int)
-        or isinstance(burn_in, bool)
-        or burn_in < 0
-    ):
+    if not isinstance(burn_in, int) or isinstance(burn_in, bool) or burn_in < 0:
         raise ValueError(f"burn_in must be a non-negative integer, got {burn_in!r}")
 
 
@@ -201,9 +197,7 @@ def estimate_replicates(
         or isinstance(num_repeats, bool)
         or num_repeats < 1
     ):
-        raise ValueError(
-            f"num_repeats must be a positive integer, got {num_repeats!r}"
-        )
+        raise ValueError(f"num_repeats must be a positive integer, got {num_repeats!r}")
 
     sites, dim = drive.shape
     kwargs = dict(dtype=drive.dtype, device=drive.device)
@@ -213,9 +207,7 @@ def estimate_replicates(
 
     total = torch.zeros(num_repeats, sites, dim, **kwargs)
     lagged = torch.zeros(num_repeats, sites, sites, **kwargs)
-    chain_total = torch.zeros(
-        num_repeats, num_chains, sites, dim, **kwargs
-    )
+    chain_total = torch.zeros(num_repeats, num_chains, sites, dim, **kwargs)
     for index in range(num_steps):
         previous, state = state, step(state, drive, couplings, beta)
         total += state.sum(1)
@@ -306,8 +298,7 @@ def estimate(
         magnetizations=magnetizations,
         covariances=covariances,
         delayed_correlations=delayed,
-        standard_error=chain_means.std(0, correction=1).norm(dim=-1)
-        / num_chains**0.5,
+        standard_error=chain_means.std(0, correction=1).norm(dim=-1) / num_chains**0.5,
         chain_magnetizations=chain_means.norm(dim=-1).mean(0),
     )
 

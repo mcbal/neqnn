@@ -109,9 +109,7 @@ def anderson(
     target[:, 0] = 1.0
 
     def gap(slot: int) -> float:
-        difference = (images[:, slot] - iterates[:, slot]).reshape(
-            -1, sites, dim
-        )
+        difference = (images[:, slot] - iterates[:, slot]).reshape(-1, sites, dim)
         return float(difference.norm(dim=-1).max())
 
     slot = 1
@@ -228,9 +226,7 @@ def local_contraction(step_fn, point: Tensor, *, iterations: int = 60) -> float:
     for _ in range(iterations):
         product = torch.autograd.grad(image, point, vector, retain_graph=True)[0]
         value = float(product.norm())
-        vector = product / product.norm().clamp_min(
-            torch.finfo(product.dtype).tiny
-        )
+        vector = product / product.norm().clamp_min(torch.finfo(product.dtype).tiny)
     return value
 
 

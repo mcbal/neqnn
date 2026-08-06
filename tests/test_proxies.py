@@ -107,7 +107,9 @@ def test_mismatch_vanishes_at_the_fixed_point_and_is_positive_away_from_it():
     dim, beta = 64, 1.0
     drive, couplings = random_problem(dim)
     step_fn = lambda m: mf.step_large_d(m, drive, couplings, beta)
-    solved = fp.anderson(step_fn, torch.zeros_like(drive), max_iter=60, tol=1e-13).solution
+    solved = fp.anderson(
+        step_fn, torch.zeros_like(drive), max_iter=60, tol=1e-13
+    ).solution
     steady_field = mf.effective_field(solved, drive, couplings)
     perturbed = mf.effective_field(0.5 * solved, drive, couplings)
 
@@ -123,7 +125,9 @@ def test_mismatch_decreases_along_a_contracting_relaxation():
     drive, couplings = random_problem(dim)
     assert mf.contraction_factor_large_d(couplings, beta) < 1
     step_fn = lambda m: mf.step_large_d(m, drive, couplings, beta)
-    solved = fp.anderson(step_fn, torch.zeros_like(drive), max_iter=60, tol=1e-13).solution
+    solved = fp.anderson(
+        step_fn, torch.zeros_like(drive), max_iter=60, tol=1e-13
+    ).solution
     trajectory = mf.relax_large_d(
         torch.zeros_like(drive), drive, couplings, beta, num_steps=40
     )

@@ -221,24 +221,32 @@ def test_causal_masking_keeps_the_prefix_independent_of_the_suffix():
     changed = x.clone()
     changed[:, 6:] = torch.randn_like(changed[:, 6:])
     assert torch.allclose(
-        module(x).magnetizations[:, :6], module(changed).magnetizations[:, :6], atol=1e-10
+        module(x).magnetizations[:, :6],
+        module(changed).magnetizations[:, :6],
+        atol=1e-10,
     )
 
 
 def test_advance_realigns_the_window():
-    state = SpinModelTransformerModule(dim=64, num_heads=2, num_steps=2).forward(
-        torch.randn(1, 10, 64)
-    ).state
+    state = (
+        SpinModelTransformerModule(dim=64, num_heads=2, num_steps=2)
+        .forward(torch.randn(1, 10, 64))
+        .state
+    )
     moved = advance(state)
     assert moved.magnetizations.shape == state.magnetizations.shape
-    assert torch.allclose(moved.magnetizations[..., :-1, :], state.magnetizations[..., 1:, :])
+    assert torch.allclose(
+        moved.magnetizations[..., :-1, :], state.magnetizations[..., 1:, :]
+    )
     assert torch.all(moved.magnetizations[..., -1, :] == 0)
 
 
 def test_advance_validates_shape_and_fill():
-    state = SpinModelTransformerModule(dim=64, num_heads=2).forward(
-        torch.randn(1, 4, 64)
-    ).state
+    state = (
+        SpinModelTransformerModule(dim=64, num_heads=2)
+        .forward(torch.randn(1, 4, 64))
+        .state
+    )
     with pytest.raises(ValueError, match="cannot drop"):
         advance(state, drop=5)
     with pytest.raises(ValueError, match="fill must have shape"):
@@ -248,9 +256,7 @@ def test_advance_validates_shape_and_fill():
 
 
 def test_post_mix_is_output_only():
-    module = SpinModelTransformerModule(
-        dim=64, num_heads=2, num_steps=2, post_mix=True
-    )
+    module = SpinModelTransformerModule(dim=64, num_heads=2, num_steps=2, post_mix=True)
     readout = module(torch.randn(2, 8, 64))
     physical = module.merge_heads(readout.state.magnetizations)
     assert torch.allclose(readout.magnetizations, physical)
@@ -279,12 +285,8 @@ def test_relaxation_indices_match_the_forward_pass():
     # k=0 is the exact initializer used by forward; k=1 is its exact output.
     assert torch.allclose(trace.magnetizations[0], probe.initial)
     assert torch.allclose(trace.magnetizations[1], readout.state.magnetizations)
-    field_0 = mf.effective_field(
-        trace.magnetizations[0], probe.drive, probe.couplings
-    )
-    field_1 = mf.effective_field(
-        trace.magnetizations[1], probe.drive, probe.couplings
-    )
+    field_0 = mf.effective_field(trace.magnetizations[0], probe.drive, probe.couplings)
+    field_1 = mf.effective_field(trace.magnetizations[1], probe.drive, probe.couplings)
     assert torch.allclose(
         vmf.response_large_d(field_0, module.beta), trace.magnetizations[1]
     )
@@ -295,9 +297,7 @@ def test_relaxation_indices_match_the_forward_pass():
     )
     assert torch.allclose(
         trace.mismatch,
-        proxies.mismatch(
-            torch.stack([field_0, field_1]), steady_field, module.beta
-        ),
+        proxies.mismatch(torch.stack([field_0, field_1]), steady_field, module.beta),
     )
     assert torch.allclose(trace.entropy_production[0], readout.entropy_production)
     assert trace.fixed_point.converged

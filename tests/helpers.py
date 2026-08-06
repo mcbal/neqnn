@@ -25,7 +25,9 @@ def slope_in_dim(errors: list[float]) -> float:
         [torch.log(torch.tensor(DIMS, dtype=torch.float64)), torch.ones(len(DIMS))], -1
     )
     return float(
-        torch.linalg.lstsq(design, torch.log(torch.tensor(errors))[:, None]).solution[0, 0]
+        torch.linalg.lstsq(design, torch.log(torch.tensor(errors))[:, None]).solution[
+            0, 0
+        ]
     )
 
 
