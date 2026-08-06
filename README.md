@@ -1,17 +1,10 @@
-# neqnn
+# 🧲 Nonequilibrium dynamics in spin-model transformers
 
-Nonequilibrium dynamics in spin-model transformers — companion code for
-[this post](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
+Companion experimental code and `neqnn` package for
+[Nonequilibrium Dynamics in Spin-Model Transformers (Bal, 2026)](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
 
 A transformer block whose forward pass is the relaxation of a vector-spin
-system. Spins live on a sphere of radius `R`, softmax attention supplies the
-coupling rule `J(X_t)`, and the layer iterates the mean-field magnetization
-recurrence
-
-    m_{k+1} = phi(x + f_FFN(x) + J(X_t) m_k)
-
-on three separated timescales: `k` for internal relaxation, `t` for the drive,
-`n` for learning.
+system after a quench. Spins live on a sphere of radius `R`, softmax attention supplies the drive-conditioned coupling rule `J(X_t)`, and the layer iterates a mean-field magnetization recurrence relation on three separated timescales: internal magnetization update (relax), external drive update (quench), and slow parameter update (learn).
 
 ```python
 import torch
@@ -20,13 +13,10 @@ from neqnn import SpinModelTransformerModule
 module = SpinModelTransformerModule(
     dim=256,
     num_heads=4,
-    num_steps=1,          # int -> finite horizon;  None -> fixed point
-    init="amortized",     # "reset" | "amortized" | "carried"
-    rope=True,
+    num_steps=1,          # int -> finite relaxation horizon;  None -> fixed point
+    init="learned",       # "reset" | "learned" | "carried"
 )
 
 out = module(torch.randn(1, 32, 256))
-out.magnetizations       # physical mean-field state, (1, 32, 256)
-out.output               # possibly post-mixed readout
-out.state                # feed to the next drive step
+out.magnetizations        # magnetizations, (1, 32, 256)
 ```
