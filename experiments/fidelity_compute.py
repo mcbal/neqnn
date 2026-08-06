@@ -42,9 +42,7 @@ def predict(
     step = mf.step_large_d if large_d else mf.step
     delayed = mf.delayed_correlations_large_d if large_d else mf.delayed_correlations
     step_fn = lambda m: step(m, drive, couplings, beta)
-    solved = fp.anderson(
-        step_fn, torch.zeros_like(drive), max_iter=max_iter, tol=tol
-    )
+    solved = fp.anderson(step_fn, torch.zeros_like(drive), max_iter=max_iter, tol=tol)
     field = mf.effective_field(solved.solution, drive, couplings)
     lagged = delayed(field, field, couplings, beta)
     return {
@@ -95,6 +93,63 @@ def sampled_errors(reference: dict, estimates, couplings, beta: float):
             / pooled.norm().clamp_min(torch.finfo(values.dtype).tiny)
         )
     return errors, floors
+
+
+def delayed_error_projection(
+    reference: torch.Tensor, replicates: torch.Tensor, couplings
+):
+    """Noise-corrected decomposition of delayed-correlation model error.
+
+    The entropy-production functional sees only the one-dimensional Frobenius
+    projection onto ``A = J - J.T``.  Cross-replicate inner products estimate
+    squared systematic errors without adding each replicate's Monte Carlo
+    variance, matching the correction used by :func:`sampled_errors`.
+    """
+    asymmetry = couplings - couplings.transpose(-1, -2)
+    asymmetry_energy = asymmetry.square().sum()
+    errors = reference.unsqueeze(0) - replicates
+    symmetric = 0.5 * (errors + errors.transpose(-1, -2))
+    antisymmetric = 0.5 * (errors - errors.transpose(-1, -2))
+
+    if asymmetry_energy > 0:
+        coefficient = (errors * asymmetry).sum((-2, -1)) / asymmetry_energy
+        parallel = coefficient[:, None, None] * asymmetry
+    else:
+        parallel = torch.zeros_like(errors)
+    antisymmetric_orthogonal = antisymmetric - parallel
+
+    components = {
+        "symmetric": symmetric,
+        "antisymmetric_orthogonal": antisymmetric_orthogonal,
+        "parallel": parallel,
+    }
+    energy = {"total": float(pair_mean(errors))}
+    energy.update({name: float(pair_mean(value)) for name, value in components.items()})
+
+    # A resolved decomposition must have a systematic error above zero in all
+    # orthogonal components. Negative cross estimates mean that Monte Carlo
+    # noise still dominates that component and should not be converted into a
+    # misleading percentage.
+    resolved = bool(
+        asymmetry_energy > 0
+        and energy["total"] > 0
+        and all(value >= 0 for name, value in energy.items() if name != "total")
+    )
+    fraction = {
+        name: energy[name] / energy["total"] if resolved else math.nan
+        for name in components
+    }
+
+    projected_reference = (reference * asymmetry).sum()
+    projected_replicates = (replicates * asymmetry).sum((-2, -1))
+    numerator = pair_mean(projected_reference - projected_replicates)
+    denominator = pair_mean(projected_replicates)
+    projected_error = (
+        float((numerator.clamp_min(0) / denominator).sqrt())
+        if denominator > 0
+        else math.nan
+    )
+    return energy, fraction, resolved, projected_error
 
 
 def sampled_diagnostics(estimates, dim: int) -> tuple[float, float]:
@@ -175,9 +230,8 @@ def main() -> None:
         parser.error(str(error))
     if args.repeats < 3:
         parser.error("--repeats must be at least 3 for noise correction")
-    if (
-        min(dims) <= 2
-        or any(not math.isfinite(value) or value <= 0 for value in us + betas)
+    if min(dims) <= 2 or any(
+        not math.isfinite(value) or value <= 0 for value in us + betas
     ):
         parser.error("dimensions must exceed 2; u and beta must be positive")
     if args.sites < 2:
@@ -185,7 +239,9 @@ def main() -> None:
     if args.fine < 2:
         parser.error("--fine must be at least 2")
     if args.chains < 2 or args.steps < 2 or args.burn_in < 0:
-        parser.error("--chains and --steps must be at least 2; --burn-in must be non-negative")
+        parser.error(
+            "--chains and --steps must be at least 2; --burn-in must be non-negative"
+        )
     if args.starts < 1:
         parser.error("--starts must be positive")
     if min(args.solve_iterations, args.branch_iterations, args.power_iterations) < 2:
@@ -209,6 +265,16 @@ def main() -> None:
     fine_residual_exact = torch.full(fine_shape, math.nan)
     fine_residual_large_d = torch.full(fine_shape, math.nan)
     fine_contraction = torch.full(fine_shape, math.nan)
+    delayed_energy = {
+        name: torch.full(sample_shape, math.nan)
+        for name in ("total", "symmetric", "antisymmetric_orthogonal", "parallel")
+    }
+    delayed_fraction = {
+        name: torch.full(sample_shape, math.nan)
+        for name in ("symmetric", "antisymmetric_orthogonal", "parallel")
+    }
+    projection_resolved = torch.zeros(sample_shape, dtype=torch.bool)
+    projected_error = torch.full(sample_shape, math.nan)
     config = {
         key: str(value) if isinstance(value, (Path, torch.device)) else value
         for key, value in vars(args).items()
@@ -216,7 +282,7 @@ def main() -> None:
 
     def payload(completed_dims: int) -> dict:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "config": config,
             "dims": dims,
             "u": us,
@@ -234,6 +300,10 @@ def main() -> None:
             "fine_residual_exact": fine_residual_exact,
             "fine_residual_large_d": fine_residual_large_d,
             "fine_contraction": fine_contraction,
+            "delayed_error_energy": delayed_energy,
+            "delayed_error_fraction": delayed_fraction,
+            "projection_resolved": projection_resolved,
+            "projected_error": projected_error,
             "completed_dims": dims[:completed_dims],
             "complete": completed_dims == len(dims),
         }
@@ -300,6 +370,19 @@ def main() -> None:
                 for name in OBSERVABLES:
                     sampled[name][d, b, u_index] = errors[name]
                     floor[name][d, b, u_index] = floors[name]
+                energies, fractions, resolved_projection, projected = (
+                    delayed_error_projection(
+                        exact["delayed"], estimates.delayed_correlations, couplings
+                    )
+                )
+                for name, value in energies.items():
+                    delayed_energy[name][d, b, u_index] = value
+                for name, value in fractions.items():
+                    delayed_fraction[name][d, b, u_index] = value
+                projection_resolved[d, b, u_index] = (
+                    resolved_projection and errors["delayed"] > floors["delayed"]
+                )
+                projected_error[d, b, u_index] = projected
                 ergodicity[d, b, u_index], chain_saturation[d, b, u_index] = (
                     sampled_diagnostics(estimates, dim)
                 )
@@ -335,10 +418,7 @@ def main() -> None:
                         exact["solution"],
                         iterations=args.power_iterations,
                     )
-                if (
-                    max(exact["residual"], approximate["residual"])
-                    <= args.residual_tol
-                ):
+                if max(exact["residual"], approximate["residual"]) <= args.residual_tol:
                     for name in OBSERVABLES:
                         large_d[name][d, b, u_index] = relative(
                             approximate[name], exact[name]

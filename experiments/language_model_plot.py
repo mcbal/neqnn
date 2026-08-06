@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.lines import Line2D
+from matplotlib.transforms import ScaledTranslation
 from PIL import Image
 
 try:
@@ -32,6 +33,60 @@ def color_ramp(count: int, start: str, end: str) -> list:
 
 def safe_ratio(values: np.ndarray, denominator: float) -> np.ndarray:
     return values / max(abs(float(denominator)), np.finfo(float).tiny)
+
+
+def display_offset(ax, x_points: float = 0, y_points: float = 0):
+    """Offset an artist in display space without changing its data coordinates."""
+    return ax.transData + ScaledTranslation(
+        x_points / 72, y_points / 72, ax.figure.dpi_scale_trans
+    )
+
+
+def path_arrow(
+    ax,
+    x,
+    y,
+    *,
+    color,
+    index: int,
+    alpha: float = 1.0,
+    linewidth: float = 1.0,
+    transform=None,
+) -> None:
+    """Place one directional arrow on a polyline segment."""
+    if len(x) < 2:
+        return
+    index = max(0, min(index, len(x) - 2))
+    x_start = x[index] + 0.25 * (x[index + 1] - x[index])
+    y_start = y[index] + 0.25 * (y[index + 1] - y[index])
+    x_end = x[index] + 0.75 * (x[index + 1] - x[index])
+    y_end = y[index] + 0.75 * (y[index + 1] - y[index])
+    ax.annotate(
+        "",
+        xy=(x_end, y_end),
+        xytext=(x_start, y_start),
+        xycoords=transform or ax.transData,
+        arrowprops={
+            "arrowstyle": "-|>",
+            "color": color,
+            "alpha": alpha,
+            "lw": linewidth,
+            "mutation_scale": 14,
+            "shrinkA": 0,
+            "shrinkB": 0,
+        },
+        zorder=5,
+    )
+
+
+def longest_visible_segment(x, y) -> int:
+    """Choose a path segment after normalizing the two plotted coordinates."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    x_scale = max(float(np.ptp(x)), np.finfo(float).tiny)
+    y_scale = max(float(np.ptp(y)), np.finfo(float).tiny)
+    lengths = np.hypot(np.diff(x) / x_scale, np.diff(y) / y_scale)
+    return int(np.argmax(lengths)) if len(lengths) else 0
 
 
 def format_parameters(count: int) -> str:
@@ -58,8 +113,7 @@ def plot_training(data: dict, prefix: str, output_dir: Path | None) -> None:
             rolling,
             color=color,
             label=(
-                f"{run['depth']} layers · "
-                f"{format_parameters(run['parameters'])} params"
+                f"{run['depth']} layers · {format_parameters(run['parameters'])} params"
             ),
         )
         loss_ax.scatter(
@@ -108,7 +162,7 @@ def plot_training(data: dict, prefix: str, output_dir: Path | None) -> None:
 
 
 def plot_timeline(data: dict, prefix: str, output_dir: Path | None) -> None:
-    """Show the thermodynamic layer diagnostics on the training clock."""
+    """Track the frozen-drive steady-state proxy on the training clock."""
     runs = data["runs"]
     has_fixed_point_entropy = all(
         "entropy_fixed_point_converged" in row
@@ -116,23 +170,9 @@ def plot_timeline(data: dict, prefix: str, output_dir: Path | None) -> None:
         for probe in run["history"]["probe"]
         for row in probe["forward"]
     )
-    has_relaxation_mismatch = all(
-        "relaxation_mismatch" in row
-        for run in runs
-        for probe in run["history"]["probe"]
-        for row in probe["forward"]
-    )
     metrics = []
     if has_fixed_point_entropy:
-        metrics.append(("entropy", "housekeeping entropy production"))
-    if has_relaxation_mismatch:
-        metrics.append(
-            (
-                "relaxation_mismatch",
-                r"one-step mismatch  "
-                r"$D_{KL}[p_{h(m_0)}\,\|\,p_{h(m_1)}]$",
-            )
-        )
+        metrics.append(("entropy", "frozen-drive steady-state irreversibility proxy"))
     if not metrics:
         print("artifact has no fixed-point proxy diagnostics; skipping timeline plot")
         return
@@ -155,9 +195,7 @@ def plot_timeline(data: dict, prefix: str, output_dir: Path | None) -> None:
         probe_steps = [probe["step"] for probe in probes]
         layer_colors = [
             layer_ramp(value)
-            for value in np.linspace(0.05, 0.95, max(run["depth"], 2))[
-                : run["depth"]
-            ]
+            for value in np.linspace(0.05, 0.95, max(run["depth"], 2))[: run["depth"]]
         ]
         for layer, color in enumerate(layer_colors):
             for row_index, (key, _) in enumerate(metrics):
@@ -170,8 +208,7 @@ def plot_timeline(data: dict, prefix: str, output_dir: Path | None) -> None:
                 )
 
         axes[0, column].set_title(
-            f"{run['depth']} layers · "
-            f"{format_parameters(run['parameters'])} parameters"
+            f"{run['depth']} layers · {format_parameters(run['parameters'])} parameters"
         )
         for row_index in range(rows):
             axes[row_index, column].set_yscale("log")
@@ -188,7 +225,9 @@ def plot_timeline(data: dict, prefix: str, output_dir: Path | None) -> None:
         ncol=2,
         fontsize=8,
     )
-    fig.suptitle("Proxy diagnostics during training", fontsize=12)
+    fig.suptitle(
+        "Frozen-drive steady-state irreversibility during training", fontsize=12
+    )
     common.save_figure(fig, f"{prefix}_timeline", output_dir)
 
 
@@ -249,7 +288,9 @@ def plot_signal(data: dict, prefix: str, output_dir: Path | None) -> None:
     for ax in axes[2]:
         ax.set_ylim(0, 1)
     axes[0, 0].legend()
-    fig.suptitle("Signal propagation across depth", fontsize=12)
+    fig.suptitle(
+        "Signal propagation across depth before and after training", fontsize=12
+    )
     common.save_figure(fig, f"{prefix}_signal", output_dir)
 
 
@@ -285,195 +326,148 @@ def plot_fields(data: dict, prefix: str, output_dir: Path | None) -> None:
 
 
 def plot_homeostasis(data: dict, prefix: str, output_dir: Path | None) -> None:
-    """Final depth profiles for saturation and local response sensitivity."""
+    """Compact cross-depth view of state and update geometry."""
     runs = data["runs"]
     required = {
         "saturation_p50",
         "saturation_p95",
-        "saturation_max",
-        "effective_u_p50",
-        "effective_u_p95",
-        "effective_u_max",
         "increment_u",
         "increment_radial_u",
-        "increment_radial_abs_u",
         "increment_transverse_u",
         "susceptibility_tangential",
         "susceptibility_radial",
-        "susceptibility_radial_p05",
+        "direction_change",
+        "direction_change_p95",
     }
     final_rows = [run["history"]["probe"][-1]["forward"] for run in runs]
     if any(required - row.keys() for final in final_rows for row in final):
         print("artifact has no homeostasis monitors; skipping homeostasis plot")
         return
 
-    fig, axes = plt.subplots(
-        4,
-        len(runs),
-        figsize=(3.55 * len(runs), 9.1),
-        sharex="col",
-        sharey="row",
-        layout="constrained",
-        squeeze=False,
-    )
-    for column, (run, final) in enumerate(zip(runs, final_rows)):
-        layers = np.arange(1, run["depth"] + 1)
-        axes[0, column].plot(
-            layers,
+    colors = color_ramp(len(runs), "#b8cde0", common.INK)
+    fig, axes = plt.subplots(2, 2, figsize=(9.5, 6.5), layout="constrained")
+
+    for run, final, color in zip(runs, final_rows, colors):
+        relative_depth = np.arange(1, run["depth"] + 1) / run["depth"]
+        label = f"{run['depth']} layers"
+        marker = "o" if run["depth"] <= 6 else None
+        common_line = dict(color=color, marker=marker, ms=2.5)
+
+        axes[0, 0].plot(
+            relative_depth,
             [row["saturation_p50"] for row in final],
-            color=common.BLUE,
-            label="median",
+            label=label,
+            **common_line,
         )
-        axes[0, column].plot(
-            layers,
+        axes[0, 0].plot(
+            relative_depth,
             [row["saturation_p95"] for row in final],
-            color=common.ORANGE,
-            label="95th percentile",
+            ls="--",
+            alpha=0.55,
+            **common_line,
         )
-        axes[0, column].plot(
-            layers,
-            [row["saturation_max"] for row in final],
-            color=common.INK,
-            ls=":",
-            label="maximum",
+
+        axes[0, 1].plot(
+            relative_depth,
+            [
+                row["susceptibility_radial"]
+                / max(row["susceptibility_tangential"], np.finfo(float).tiny)
+                for row in final
+            ],
+            label=label,
+            **common_line,
         )
-        axes[0, column].axhspan(0.7, 0.8, color=common.ORANGE, alpha=0.06)
-        axes[0, column].axhspan(0.8, 1.0, color=common.ORANGE, alpha=0.12)
 
-        for key, color, label, style in (
-            ("effective_u_p50", common.BLUE, "median", "-"),
-            ("effective_u_p95", common.ORANGE, "95th percentile", "-"),
-            ("effective_u_max", common.INK, "maximum", ":"),
-        ):
-            axes[1, column].plot(
-                layers,
-                [row[key] for row in final],
-                color=color,
-                ls=style,
-                label=label,
-            )
-
-        for key, color, label, style in (
-            ("increment_u", common.INK, r"$\|\Delta h\|$", "-"),
-            ("increment_transverse_u", common.BLUE, "transverse", "-"),
-            ("increment_radial_u", common.ORANGE, "signed radial", "-"),
-            ("increment_radial_abs_u", common.ORANGE, "absolute radial", ":"),
-        ):
-            axes[2, column].plot(
-                layers,
-                [row[key] for row in final],
-                color=color,
-                ls=style,
-                label=label,
-            )
-        axes[2, column].axhline(0, color=common.MUTED, lw=0.7)
-
-        for key, color, label, style in (
-            ("susceptibility_tangential", common.BLUE, "tangential mean", "-"),
-            ("susceptibility_radial", common.ORANGE, "radial mean", "-"),
-            ("susceptibility_radial_p05", common.INK, "radial 5th percentile", ":"),
-        ):
-            axes[3, column].plot(
-                layers,
-                [row[key] for row in final],
-                color=color,
-                ls=style,
-                label=label,
-            )
-
-        axes[0, column].set_title(f"{run['depth']} layers")
-        axes[0, column].set_ylim(0, 1)
-        axes[3, column].set_xlabel("layer")
-
-    for row, label in enumerate(
-        (
-            r"output saturation  $\|m\|/R$",
-            r"effective field  $u=\beta\|h\|/R$",
-            r"field increment in $u$ units",
-            "local susceptibility",
-        )
-    ):
-        axes[row, 0].set_ylabel(label)
-        axes[row, 0].legend(fontsize=7.2)
-    fig.suptitle("Module-local homeostasis at the final checkpoint", fontsize=12)
-    common.save_figure(fig, f"{prefix}_homeostasis", output_dir)
-
-
-def plot_effective_depth(data: dict, prefix: str, output_dir: Path | None) -> None:
-    """Show whether successive residual updates still rotate the representation."""
-    runs = data["runs"]
-    required = {
-        "direction_change",
-        "direction_change_p95",
-        "increment_relative",
-        "increment_radial_relative",
-        "increment_transverse_relative",
-        "ffn_increment_radial_u",
-        "coupling_increment_radial_u",
-    }
-    final_rows = [run["history"]["probe"][-1]["forward"] for run in runs]
-    if any(required - row.keys() for final in final_rows for row in final):
-        print("artifact has no effective-depth monitors; skipping effective-depth plot")
-        return
-
-    fig, axes = plt.subplots(
-        3,
-        len(runs),
-        figsize=(3.55 * len(runs), 7.4),
-        sharex="col",
-        sharey="row",
-        layout="constrained",
-        squeeze=False,
-    )
-    for column, (run, final) in enumerate(zip(runs, final_rows)):
-        layers = np.arange(1, run["depth"] + 1)
-        axes[0, column].plot(
-            layers,
+        axes[1, 0].plot(
+            relative_depth,
             np.degrees([row["direction_change"] for row in final]),
-            color=common.BLUE,
-            label="mean",
+            label=label,
+            **common_line,
         )
-        axes[0, column].plot(
-            layers,
+        axes[1, 0].plot(
+            relative_depth,
             np.degrees([row["direction_change_p95"] for row in final]),
-            color=common.ORANGE,
-            label="95th percentile",
+            ls="--",
+            alpha=0.55,
+            **common_line,
         )
 
-        for key, color, label in (
-            ("increment_relative", common.INK, "total"),
-            ("increment_transverse_relative", common.BLUE, "transverse"),
-            ("increment_radial_relative", common.ORANGE, "signed radial"),
-        ):
-            axes[1, column].plot(
-                layers, [row[key] for row in final], color=color, label=label
-            )
-        axes[1, column].axhline(0, color=common.MUTED, lw=0.7)
-
-        for key, color, label in (
-            ("increment_radial_u", common.INK, "total"),
-            ("ffn_increment_radial_u", common.ORANGE, "FFN"),
-            ("coupling_increment_radial_u", common.GREEN, "attention"),
-        ):
-            axes[2, column].plot(
-                layers, [row[key] for row in final], color=color, label=label
-            )
-        axes[2, column].axhline(0, color=common.MUTED, lw=0.7)
-
-        axes[0, column].set_title(f"{run['depth']} layers")
-        axes[2, column].set_xlabel("layer")
-
-    for row, label in enumerate(
-        (
-            "field-direction change (degrees)",
-            r"increment relative to carrier  $\Delta h/h$",
-            r"signed radial increment in $u$ units",
+        increment = np.asarray([row["increment_u"] for row in final])
+        denominator = np.maximum(increment, np.finfo(float).tiny)
+        axes[1, 1].plot(
+            relative_depth,
+            np.asarray([row["increment_transverse_u"] for row in final]) / denominator,
+            label=label,
+            **common_line,
         )
-    ):
-        axes[row, 0].set_ylabel(label)
-        axes[row, 0].legend(fontsize=7.2)
-    fig.suptitle("Effective depth in conjugate-field coordinates", fontsize=12)
-    common.save_figure(fig, f"{prefix}_effective_depth", output_dir)
+        axes[1, 1].plot(
+            relative_depth,
+            np.asarray([row["increment_radial_u"] for row in final]) / denominator,
+            ls="--",
+            alpha=0.65,
+            **common_line,
+        )
+
+    axes[0, 0].set(
+        title="state saturation",
+        ylabel=r"$\|m\|/R$",
+        ylim=(0, 1),
+    )
+    axes[0, 0].axhspan(0.8, 1.0, color=common.ORANGE, alpha=0.08)
+    axes[0, 1].set(
+        title="response anisotropy",
+        ylabel=r"$\chi_{\mathrm{radial}}/\chi_{\mathrm{tangential}}$",
+        ylim=(0, 1),
+    )
+    axes[1, 0].set(
+        title="successive reorientation",
+        ylabel="field-direction change (degrees)",
+    )
+    axes[1, 1].set(
+        title="update geometry",
+        ylabel=r"component / $\|\Delta h\|$",
+        ylim=(-0.75, 1.05),
+    )
+    axes[1, 1].axhline(0, color=common.MUTED, lw=0.7)
+    for ax in axes[1]:
+        ax.set_xlabel(r"relative layer depth  $l/L$")
+    axes[0, 0].legend(
+        handles=[
+            Line2D([], [], color=common.INK, label="median"),
+            Line2D(
+                [], [], color=common.INK, ls="--", alpha=0.55, label="95th percentile"
+            ),
+        ],
+        loc="lower right",
+        fontsize=7.5,
+    )
+    axes[0, 1].legend(
+        handles=[
+            Line2D([], [], color=color, label=f"{run['depth']} layers")
+            for run, color in zip(runs, colors)
+        ],
+        fontsize=8,
+    )
+    axes[1, 0].legend(
+        handles=[
+            Line2D([], [], color=common.INK, label="mean"),
+            Line2D(
+                [], [], color=common.INK, ls="--", alpha=0.55, label="95th percentile"
+            ),
+        ],
+        fontsize=7.5,
+    )
+    axes[1, 1].legend(
+        handles=[
+            Line2D([], [], color=common.INK, label="transverse"),
+            Line2D(
+                [], [], color=common.INK, ls="--", alpha=0.65, label="signed radial"
+            ),
+        ],
+        fontsize=7.5,
+    )
+    fig.suptitle("State and update geometry across depth", fontsize=12)
+    common.save_figure(fig, f"{prefix}_homeostasis", output_dir)
 
 
 def plot_layer_ablation(data: dict, prefix: str, output_dir: Path | None) -> None:
@@ -488,44 +482,404 @@ def plot_layer_ablation(data: dict, prefix: str, output_dir: Path | None) -> Non
         return
 
     colors = color_ramp(len(runs), "#b8cde0", common.INK)
-    fig, (loss_ax, kl_ax) = plt.subplots(
-        1, 2, figsize=(9.5, 3.7), layout="constrained"
-    )
+    fig, loss_ax = plt.subplots(figsize=(6.3, 3.8), layout="constrained")
     for run, color in zip(runs, colors):
         rows = run["history"]["layer_ablation"]["layers"]
-        layers = [row["layer"] for row in rows]
+        layers = np.asarray([row["layer"] for row in rows]) / run["depth"]
         label = f"{run['depth']} layers"
         loss_ax.plot(
             layers,
-            [row["loss_delta"] for row in rows],
+            [max(row["loss_delta"], np.finfo(float).tiny) for row in rows],
             color=color,
             marker="o",
             ms=3,
             label=label,
         )
-        kl_ax.plot(
-            layers,
-            [max(row["kl_from_full"], np.finfo(float).tiny) for row in rows],
-            color=color,
-            marker="o",
-            ms=3,
-            label=label,
-        )
-    loss_ax.axhline(0, color=common.MUTED, lw=0.8)
     loss_ax.set(
-        xlabel="skipped layer",
+        xlabel=r"relative skipped-layer position  $l/L$",
         ylabel=r"held-out loss change  $\mathcal{L}_{skip}-\mathcal{L}_{full}$",
-        title="task effect",
-    )
-    kl_ax.set(
-        xlabel="skipped layer",
-        ylabel=r"$D_{KL}(p_{full}\,\|\,p_{skip})$",
         yscale="log",
-        title="output-distribution effect",
+        title="task effect of removing one update",
     )
     loss_ax.legend()
-    kl_ax.legend()
+    fig.suptitle("Individual layers become less indispensable with depth", fontsize=12)
     common.save_figure(fig, f"{prefix}_layer_ablation", output_dir)
+
+
+def plot_relaxation_interventions(
+    data: dict, prefix: str, output_dir: Path | None
+) -> None:
+    """Relate task degradation directly to approach toward the fixed point."""
+    runs = [
+        run for run in data["runs"] if run["history"].get("relaxation_interventions")
+    ]
+    if not runs:
+        print("artifact has no K interventions; skipping intervention plot")
+        return
+    if len(runs) > 1:
+        print("plotting the first run with K interventions")
+    run = runs[0]
+    records = run["history"]["relaxation_interventions"]
+    final = records[-1]
+    final_rows = final["layers"]
+    available = final_rows[0]["loss_delta"]
+    styles = {
+        "1": (common.INK, r"$K=1$", "-", "o"),
+        "2": (common.ORANGE, r"$K=2$", "-", "o"),
+        "4": (common.GREEN, r"$K=4$", "-", "o"),
+        "inf": (common.BLUE, r"$K=\infty$", "--", "o"),
+    }
+    conditions = [key for key in ("1", "2", "4", "inf") if key in available]
+    fig, axes = plt.subplots(1, 2, figsize=(9.8, 4.4), layout="constrained")
+
+    def paired_sem(row, horizon):
+        values = np.asarray(row["loss_delta_batches"][horizon], dtype=float)
+        finite = values[np.isfinite(values)]
+        return finite.std(ddof=1) / finite.size**0.5 if finite.size > 1 else 0.0
+
+    final_layer_rows = [
+        next(row for row in record["layers"] if row["layer"] == run["depth"])
+        for record in records
+    ]
+    dither = {
+        "1": (0, 0),
+        "2": (0, 0),
+        "4": (2.0, 1.5),
+        "inf": (-2.0, -1.5),
+    }
+    for condition in conditions:
+        color, label, linestyle, marker = styles[condition]
+        x = [row["rms"][condition] for row in final_layer_rows]
+        y = [row["loss_delta"][condition] for row in final_layer_rows]
+        transform = display_offset(axes[0], *dither[condition])
+        axes[0].errorbar(
+            x,
+            y,
+            yerr=[paired_sem(row, condition) for row in final_layer_rows],
+            color=color,
+            ls=linestyle,
+            marker=marker,
+            ms=3,
+            capsize=1.5,
+            label=label,
+            transform=transform,
+        )
+        axes[0].scatter(
+            [x[0]],
+            [y[0]],
+            s=32,
+            facecolors=common.SURFACE,
+            edgecolors=color,
+            zorder=4,
+            transform=transform,
+        )
+        axes[0].scatter(
+            [x[-1]], [y[-1]], s=34, color=color, zorder=4, transform=transform
+        )
+        path_arrow(
+            axes[0],
+            x,
+            y,
+            color=color,
+            index=longest_visible_segment(x, y),
+            linewidth=1.5,
+            transform=transform,
+        )
+
+    left_x = [
+        row["rms"][condition] for row in final_layer_rows for condition in conditions
+    ]
+    left_y_low = [
+        row["loss_delta"][condition] - paired_sem(row, condition)
+        for row in final_layer_rows
+        for condition in conditions
+    ]
+    left_y_high = [
+        row["loss_delta"][condition] + paired_sem(row, condition)
+        for row in final_layer_rows
+        for condition in conditions
+    ]
+    x_span = max(left_x) - min(left_x)
+    y_span = max(left_y_high) - min(left_y_low)
+    axes[0].set_xlim(-0.025, max(left_x) + 0.06 * max(x_span, 1e-3))
+    axes[0].set_ylim(
+        min(left_y_low) - 0.06 * max(y_span, 1e-3),
+        max(left_y_high) + 0.40 * max(y_span, 1e-3),
+    )
+
+    for row in final_rows:
+        x = [row["rms"][condition] for condition in conditions]
+        y = [row["loss_delta"][condition] for condition in conditions]
+        line_color = common.BLUE
+        alpha = 0.48
+        axes[1].plot(
+            x,
+            y,
+            color=line_color,
+            lw=1.0,
+            alpha=alpha,
+            zorder=2,
+        )
+        axes[1].errorbar(
+            x,
+            y,
+            yerr=[paired_sem(row, condition) for condition in conditions],
+            fmt="none",
+            ecolor=line_color,
+            alpha=alpha,
+            capsize=1.5,
+            zorder=1,
+        )
+        for x_value, y_value, condition in zip(x, y, conditions):
+            color, _, _, _ = styles[condition]
+            is_baseline = condition == "1"
+            axes[1].scatter(
+                [x_value],
+                [y_value],
+                s=34 if is_baseline else 22,
+                facecolors=common.INK if is_baseline else color,
+                edgecolors=common.INK if is_baseline else color,
+                linewidths=1.2 if is_baseline else 0.9,
+                alpha=1.0 if is_baseline else 0.62,
+                zorder=3,
+            )
+        path_arrow(
+            axes[1],
+            x,
+            y,
+            color=line_color,
+            index=0,
+            alpha=0.8,
+            linewidth=1.1,
+        )
+        label_offsets = {
+            1: (5, 7),
+            2: (5, 6),
+            3: (5, -10),
+            4: (5, -10),
+            5: (5, 5),
+            6: (5, -10),
+        }
+        axes[1].annotate(
+            f"L{row['layer']}",
+            (x[1], y[1]),
+            xytext=label_offsets[row["layer"]],
+            textcoords="offset points",
+            color=common.MUTED,
+            fontsize=7.2,
+        )
+
+    for ax in axes:
+        ax.axhline(0, color=common.MUTED, lw=0.7, ls=":")
+        ax.set_xlabel(r"state RMS to fixed point  $\|m-m^\star\|$")
+        ax.set_xlim(left=-0.025)
+    axes[0].set(
+        title="Final layer across training",
+        ylabel=r"held-out $\mathrm{CE}-\mathrm{CE}(K=1)$",
+    )
+    axes[0].legend(ncol=1, loc="upper left", fontsize=8)
+    axes[0].text(
+        0.98,
+        0.98,
+        "open: initialization · filled: final · arrows: training time\n"
+        "small display offsets separate overlapping paths",
+        transform=axes[0].transAxes,
+        ha="right",
+        va="top",
+        color=common.MUTED,
+        fontsize=7.5,
+    )
+    axes[1].set(
+        title="Each layer follows its own relaxation path",
+        ylabel=r"held-out $\mathrm{CE}-\mathrm{CE}(K=1)$",
+    )
+    axes[1].text(
+        0.98,
+        0.47,
+        "arrows: increasing K",
+        transform=axes[1].transAxes,
+        ha="right",
+        color=common.MUTED,
+        fontsize=7.5,
+    )
+
+    if final.get("joint") is not None:
+        joint = final["joint"]
+        inset = axes[1].inset_axes([0.61, 0.61, 0.35, 0.31])
+        positions = np.arange(len(conditions))
+        joint_y = [joint["loss_delta"][condition] for condition in conditions]
+        inset.plot(positions, joint_y, color=common.MUTED, lw=0.8, zorder=1)
+        inset.errorbar(
+            positions,
+            joint_y,
+            yerr=[paired_sem(joint, condition) for condition in conditions],
+            fmt="none",
+            ecolor=common.MUTED,
+            capsize=1.5,
+            zorder=1,
+        )
+        for position, value, condition in zip(positions, joint_y, conditions):
+            inset.scatter(position, value, color=styles[condition][0], s=22, zorder=2)
+        inset.axhline(0, color=common.MUTED, lw=0.6, ls=":")
+        inset.set_xticks(positions, ["1", "2", "4", r"$\infty$"])
+        inset.tick_params(labelsize=6.5)
+        inset.set_title("all layers jointly", fontsize=7.5)
+        inset.set_ylabel(r"$\Delta$CE", fontsize=7)
+
+    fig.suptitle(
+        f"Frozen-protocol relaxation interventions · depth {run['depth']}",
+        fontsize=12,
+    )
+    common.save_figure(fig, f"{prefix}_relaxation_intervention", output_dir)
+
+
+def plot_initializer_causal_test(
+    data: dict, prefix: str, output_dir: Path | None
+) -> None:
+    """Test which physical launch state makes one frozen update useful."""
+    runs = [
+        run for run in data["runs"] if run["history"].get("relaxation_interventions")
+    ]
+    if not runs:
+        return
+    run = runs[0]
+    records = run["history"]["relaxation_interventions"]
+    final_rows = records[-1]["layers"]
+    if not final_rows or "initializer_causal" not in final_rows[0]:
+        print("artifact has no initializer causal test; skipping causal plot")
+        return
+
+    styles = {
+        "actual": (common.INK, "learned values", "-", "o"),
+        "carrier": (common.PURPLE, "residual", "-.", "^"),
+        "zero": (common.MUTED, "zero", ":", "s"),
+        "shuffled": (common.ORANGE, "shuffled values", "--", "x"),
+    }
+    conditions = list(styles)
+    fig, axes = plt.subplots(1, 2, figsize=(9.8, 4.4), layout="constrained")
+
+    def causal(row):
+        return row["initializer_causal"]
+
+    def paired_sem(row, condition):
+        values = np.asarray(causal(row)["loss_delta_batches"][condition], dtype=float)
+        finite = values[np.isfinite(values)]
+        return finite.std(ddof=1) / finite.size**0.5 if finite.size > 1 else 0.0
+
+    final_layer_rows = [
+        next(row for row in record["layers"] if row["layer"] == run["depth"])
+        for record in records
+    ]
+    for condition in conditions:
+        color, label, linestyle, marker = styles[condition]
+        x = [causal(row)["rms"][condition] for row in final_layer_rows]
+        y = [causal(row)["loss_delta"][condition] for row in final_layer_rows]
+        axes[0].errorbar(
+            x,
+            y,
+            yerr=[paired_sem(row, condition) for row in final_layer_rows],
+            color=color,
+            ls=linestyle,
+            marker=marker,
+            ms=3,
+            capsize=1.5,
+            label=label,
+        )
+        axes[0].scatter(
+            [x[0]],
+            [y[0]],
+            s=32,
+            facecolors=common.SURFACE,
+            edgecolors=color,
+            zorder=4,
+        )
+        axes[0].scatter([x[-1]], [y[-1]], s=34, color=color, zorder=4)
+        path_arrow(
+            axes[0],
+            x,
+            y,
+            color=color,
+            index=longest_visible_segment(x, y),
+            linewidth=1.5,
+        )
+
+        x = [causal(row)["rms"][condition] for row in final_rows]
+        y = [causal(row)["loss_delta"][condition] for row in final_rows]
+        axes[1].errorbar(
+            x,
+            y,
+            yerr=[paired_sem(row, condition) for row in final_rows],
+            fmt="none",
+            ecolor=color,
+            alpha=0.8,
+            capsize=1.5,
+        )
+        axes[1].plot(
+            x,
+            y,
+            color=color,
+            ls=linestyle,
+            label=label,
+        )
+        for layer_index, (x_value, y_value) in enumerate(zip(x, y)):
+            is_first = layer_index == 0
+            is_final = layer_index == len(x) - 1
+            axes[1].scatter(
+                [x_value],
+                [y_value],
+                marker="o",
+                s=38 if is_first or is_final else 14,
+                facecolors=common.SURFACE if is_first else color,
+                edgecolors=color,
+                linewidths=1.0,
+                zorder=3,
+            )
+        path_arrow(
+            axes[1],
+            x,
+            y,
+            color=color,
+            index=longest_visible_segment(x, y),
+            linewidth=1.5,
+        )
+
+    for ax in axes:
+        ax.axhline(0, color=common.MUTED, lw=0.7, ls=":")
+        ax.set_xlabel(r"state RMS to fixed point  $\|m_1-m^\star\|$")
+        ax.set_xlim(left=0)
+    axes[0].set(
+        title="Final layer across training",
+        ylabel="held-out CE − learned-values baseline",
+    )
+    axes[0].legend(ncol=2, fontsize=8)
+    axes[0].text(
+        0.02,
+        0.98,
+        "open: initialization · filled: final · arrows: training time",
+        transform=axes[0].transAxes,
+        va="top",
+        color=common.MUTED,
+        fontsize=7.5,
+    )
+    axes[1].set(
+        title="Task alignment, not fixed-point proximity",
+        ylabel="held-out CE − learned-values baseline",
+    )
+    axes[1].legend(ncol=2, fontsize=8)
+    axes[1].text(
+        0.02,
+        0.82,
+        "large open: L1 · large filled: L6 · arrows: depth",
+        transform=axes[1].transAxes,
+        ha="left",
+        color=common.MUTED,
+        fontsize=7.5,
+    )
+    fig.suptitle(
+        f"One frozen update from alternative starting points · depth {run['depth']}",
+        fontsize=12,
+    )
+    common.save_figure(fig, f"{prefix}_initializer_causal", output_dir)
 
 
 def wrapped_sample(text: str, width: int = 88) -> str:
@@ -557,11 +911,7 @@ def plot_samples(
     output_dir = common.FIGURES if output_dir is None else output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     steps = sorted(
-        {
-            sample["step"]
-            for run in runs
-            for sample in run["history"]["samples"]
-        }
+        {sample["step"] for run in runs for sample in run["history"]["samples"]}
     )
     fig, axes = plt.subplots(
         len(runs),
@@ -617,9 +967,7 @@ def plot_samples(
             prompt_cards, generated_cards, runs
         ):
             available = [
-                sample
-                for sample in run["history"]["samples"]
-                if sample["step"] <= step
+                sample for sample in run["history"]["samples"] if sample["step"] <= step
             ]
             chosen = available[-1] if available else run["history"]["samples"][0]
             text = chosen["text"]
@@ -661,8 +1009,9 @@ def plot(
     plot_signal(data, prefix, output_dir)
     plot_fields(data, prefix, output_dir)
     plot_homeostasis(data, prefix, output_dir)
-    plot_effective_depth(data, prefix, output_dir)
     plot_layer_ablation(data, prefix, output_dir)
+    plot_relaxation_interventions(data, prefix, output_dir)
+    plot_initializer_causal_test(data, prefix, output_dir)
 
 
 def main() -> None:

@@ -27,6 +27,10 @@ from neqnn import proxies as physical_proxies
 from neqnn import vmf
 
 COMPONENTS = ("to_qk", "to_v", "ffn", "drive_norm", "attn_temperature")
+INTERVENTION_HORIZONS = ("0", "1", "2", "4", "inf")
+INTERVENTION_CONDITIONS = ("carrier", *INTERVENTION_HORIZONS)
+INITIALIZER_CAUSAL_CONDITIONS = ("actual", "carrier", "zero", "shuffled")
+MAX_FINITE_INTERVENTION_HORIZON = 4
 DEFAULT_CORPUS_URL = "https://www.gutenberg.org/cache/epub/28054/pg28054.txt"
 
 
@@ -77,7 +81,14 @@ def corpus(path: Path, holdout: float, url: str = DEFAULT_CORPUS_URL):
     tokens = torch.tensor([encode[character] for character in text], dtype=torch.long)
     split = int((1 - holdout) * len(tokens))
     digest = hashlib.sha256(text.encode()).hexdigest()
-    return tokens[:split], tokens[split:], vocabulary, digest, text[:split], text[split:]
+    return (
+        tokens[:split],
+        tokens[split:],
+        vocabulary,
+        digest,
+        text[:split],
+        text[split:],
+    )
 
 
 def ngram_baselines(train: str, valid: str, alpha: float = 0.1) -> dict:
@@ -181,9 +192,7 @@ class LanguageModel(nn.Module):
 
 
 def gradient_rms(parameters) -> float:
-    parameters = [
-        parameter for parameter in parameters if parameter.grad is not None
-    ]
+    parameters = [parameter for parameter in parameters if parameter.grad is not None]
     count = sum(parameter.numel() for parameter in parameters)
     squared = sum(
         float(parameter.grad.float().square().sum()) for parameter in parameters
@@ -203,9 +212,7 @@ def gradient_norm(parameters) -> float:
 def distribution(values: Tensor) -> dict[str, float]:
     """Small detached summary for per-site physical diagnostics."""
     flattened = values.detach().float().reshape(-1)
-    quantiles = torch.quantile(
-        flattened, flattened.new_tensor([0.05, 0.5, 0.95])
-    )
+    quantiles = torch.quantile(flattened, flattened.new_tensor([0.05, 0.5, 0.95]))
     return {
         "mean": float(flattened.mean()),
         "p05": float(quantiles[0]),
@@ -228,9 +235,7 @@ def signals(model, activations, probes):
         with torch.no_grad():
             settled = layer.split_heads(activation)
             update_field = probe.drive + coupling
-            initializer_field = vmf.inverse_response_large_d(
-                probe.initial, layer.beta
-            )
+            initializer_field = vmf.inverse_response_large_d(probe.initial, layer.beta)
             settled_field = vmf.inverse_response_large_d(settled, layer.beta)
             # Compare exactly the two endpoint magnetizations, expressed in
             # the conjugate-field coordinates that parameterize their vMF laws:
@@ -247,9 +252,7 @@ def signals(model, activations, probes):
 
             def components(value):
                 radial = (value * carrier_direction).sum(-1)
-                transverse = (
-                    value.pow(2).sum(-1) - radial.pow(2)
-                ).clamp_min(0).sqrt()
+                transverse = (value.pow(2).sum(-1) - radial.pow(2)).clamp_min(0).sqrt()
                 return value.norm(dim=-1), radial, transverse
 
             increment_norm, increment_radial, increment_transverse = components(
@@ -276,9 +279,7 @@ def signals(model, activations, probes):
             ffn_transverse_u = layer.beta * ffn_transverse / layer.radius_head
             coupling_u = layer.beta * coupling_norm / layer.radius_head
             coupling_radial_u = layer.beta * coupling_radial / layer.radius_head
-            coupling_transverse_u = (
-                layer.beta * coupling_transverse / layer.radius_head
-            )
+            coupling_transverse_u = layer.beta * coupling_transverse / layer.radius_head
             stiffness = vmf.gamma(update_field, layer.beta).squeeze(-1)
             susceptibility_tangential = layer.beta / (1 + stiffness)
             susceptibility_radial = layer.beta / (stiffness * (1 + stiffness))
@@ -352,12 +353,8 @@ def signals(model, activations, probes):
                 "ffn_increment_transverse_u": float(ffn_transverse_u.mean()),
                 "coupling_increment_u": float(coupling_u.mean()),
                 "coupling_increment_radial_u": float(coupling_radial_u.mean()),
-                "coupling_increment_transverse_u": float(
-                    coupling_transverse_u.mean()
-                ),
-                "susceptibility_tangential": float(
-                    susceptibility_tangential.mean()
-                ),
+                "coupling_increment_transverse_u": float(coupling_transverse_u.mean()),
+                "susceptibility_tangential": float(susceptibility_tangential.mean()),
                 "susceptibility_radial": radial_susceptibility_stats["mean"],
                 "susceptibility_radial_p05": radial_susceptibility_stats["p05"],
                 "entropy": entropy,
@@ -455,6 +452,350 @@ def evaluate_layer_ablation(model, tokens, args, seed):
     return {"baseline_loss": float(baseline), "layers": rows}
 
 
+def _intervention_state(layer, trace, horizon: str):
+    if horizon == "inf":
+        return trace.fixed_point.solution if trace.fixed_point.converged else None
+    return trace.magnetizations[int(horizon)]
+
+
+def _carrier_state(layer, probe):
+    """Physical pass-through state in the module's declared input coordinate.
+
+    A field input must first respond through ``phi`` to become a magnetization;
+    a magnetization input is already a physical state. This excludes the FFN,
+    attention interaction, and amortized value initializer.
+    """
+    if layer.input_mode == "field":
+        return vmf.response_large_d(probe.x, layer.beta)
+    return probe.x
+
+
+def _state_mismatch(trace, horizon: str) -> tuple[float, float]:
+    if not trace.fixed_point.converged:
+        return math.nan, math.nan
+    if horizon == "inf":
+        return 0.0, 0.0
+    index = int(horizon)
+    state = trace.magnetizations[index]
+    rms = (state - trace.fixed_point.solution).square().sum(-1).mean(-1).sqrt().mean()
+    return float(rms), float(trace.mismatch[index].mean())
+
+
+def _counterfactual_mismatch(layer, state, trace, probe) -> tuple[float, float]:
+    if not trace.fixed_point.converged:
+        return math.nan, math.nan
+    rms = (state - trace.fixed_point.solution).square().sum(-1).mean(-1).sqrt().mean()
+    field = mf.effective_field(state, probe.drive, probe.couplings)
+    steady_field = mf.effective_field(
+        trace.fixed_point.solution, probe.drive, probe.couplings
+    )
+    field_kl = physical_proxies.mismatch(field, steady_field, layer.beta).mean()
+    return float(rms), float(field_kl)
+
+
+def _initializer_start(layer, probe, condition: str, permutation):
+    """Choose a physical start while leaving the frozen protocol untouched.
+
+    The shuffled control permutes whole examples, not sites, so a causal model
+    never receives a future-position value at an earlier sequence position.
+    """
+    if condition == "actual":
+        return probe.initial
+    if condition == "carrier":
+        return _carrier_state(layer, probe)
+    if condition == "zero":
+        return torch.zeros_like(probe.initial)
+    if condition == "shuffled":
+        return probe.initial.index_select(0, permutation)
+    raise ValueError(f"unknown initializer causal condition {condition!r}")
+
+
+def _one_step_from_start(layer, probe, start):
+    return mf.step_large_d(start, probe.drive, probe.couplings, layer.beta)
+
+
+def _joint_horizon_output(layer, x, horizon: str):
+    """Advance one layer without paying for an unused finite-K fixed point."""
+    ordinary = layer(x, probe=True)
+    if horizon == "carrier":
+        return layer.merge_heads(_carrier_state(layer, ordinary.probe)), True
+    if horizon == "0":
+        return layer.merge_heads(ordinary.probe.initial), True
+    if horizon == "1":
+        return ordinary.magnetizations, True
+    if horizon == "inf":
+        trace = layer.relaxation(x, num_steps=1)
+        if not trace.fixed_point.converged:
+            return None, False
+        return layer.merge_heads(trace.fixed_point.solution), True
+    trajectory = mf.relax_large_d(
+        ordinary.probe.initial,
+        ordinary.probe.drive,
+        ordinary.probe.couplings,
+        layer.beta,
+        num_steps=int(horizon),
+    )
+    return layer.merge_heads(trajectory[-1]), True
+
+
+def _mean(values) -> float:
+    return float(torch.tensor(values, dtype=torch.float64).mean())
+
+
+@torch.no_grad()
+def evaluate_relaxation_interventions(
+    model,
+    tokens,
+    args,
+    seed: int,
+    *,
+    all_layers: bool,
+):
+    """Apply frozen-protocol K changes locally, then run the suffix at K=1.
+
+    Intermediate-layer states are never decoded directly. An altered state is
+    fed through every later trained module in the ordinary way, so its cross
+    entropy is an end-to-end causal effect. The optional joint profile is a
+    cumulative systems intervention and is kept separate from the layer-local
+    attribution.
+    """
+    was_training = model.training
+    model.eval()
+    generator = torch.Generator().manual_seed(seed)
+    batches = [
+        batch(tokens, args.batch_size, args.seq_len, generator, args.device)
+        for _ in range(args.intervention_batches)
+    ]
+    shuffle_generator = torch.Generator().manual_seed(seed + 1)
+    permutations = []
+    identity = torch.arange(args.batch_size)
+    for _ in batches:
+        permutation = torch.randperm(args.batch_size, generator=shuffle_generator)
+        if torch.equal(permutation, identity):
+            permutation = permutation.roll(1)
+        permutations.append(permutation.to(args.device))
+    selected_layers = (
+        list(range(len(model.layers))) if all_layers else [len(model.layers) - 1]
+    )
+    records = {
+        layer_index: {
+            "loss_batches": {condition: [] for condition in INTERVENTION_CONDITIONS},
+            "rms_batches": {condition: [] for condition in INTERVENTION_CONDITIONS},
+            "field_kl_batches": {
+                condition: [] for condition in INTERVENTION_CONDITIONS
+            },
+            "initializer_loss_batches": {
+                condition: [] for condition in INITIALIZER_CAUSAL_CONDITIONS
+            },
+            "initializer_rms_batches": {
+                condition: [] for condition in INITIALIZER_CAUSAL_CONDITIONS
+            },
+            "initializer_field_kl_batches": {
+                condition: [] for condition in INITIALIZER_CAUSAL_CONDITIONS
+            },
+            "converged": [],
+            "fixed_point_residual": [],
+        }
+        for layer_index in selected_layers
+    }
+    baseline_batches = []
+    joint_batches = (
+        {condition: [] for condition in INTERVENTION_CONDITIONS} if all_layers else None
+    )
+
+    try:
+        for batch_index, (token_ids, targets) in enumerate(batches):
+            x = model.embedding(token_ids)
+            layer_inputs = []
+            for layer in model.layers:
+                layer_inputs.append(x)
+                x = layer(x).magnetizations
+            baseline_logits = model.readout(x)
+            baseline_loss = F.cross_entropy(
+                baseline_logits.flatten(0, 1), targets.flatten()
+            )
+            baseline_batches.append(float(baseline_loss))
+
+            for layer_index in selected_layers:
+                layer = model.layers[layer_index]
+                ordinary = layer(layer_inputs[layer_index], probe=True)
+                trace = layer.relaxation(
+                    layer_inputs[layer_index],
+                    num_steps=MAX_FINITE_INTERVENTION_HORIZON,
+                )
+                row = records[layer_index]
+                row["converged"].append(trace.fixed_point.converged)
+                row["fixed_point_residual"].append(trace.fixed_point.residual)
+                for condition in INTERVENTION_CONDITIONS:
+                    state = (
+                        _carrier_state(layer, ordinary.probe)
+                        if condition == "carrier"
+                        else _intervention_state(layer, trace, condition)
+                    )
+                    if state is None:
+                        loss = math.nan
+                    else:
+                        altered = layer.merge_heads(state)
+                        for suffix in model.layers[layer_index + 1 :]:
+                            altered = suffix(altered).magnetizations
+                        logits = model.readout(altered)
+                        loss = float(
+                            F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+                        )
+                    rms, field_kl = (
+                        _counterfactual_mismatch(layer, state, trace, ordinary.probe)
+                        if condition == "carrier"
+                        else _state_mismatch(trace, condition)
+                    )
+                    row["loss_batches"][condition].append(loss)
+                    row["rms_batches"][condition].append(rms)
+                    row["field_kl_batches"][condition].append(field_kl)
+
+                for condition in INITIALIZER_CAUSAL_CONDITIONS:
+                    start = _initializer_start(
+                        layer,
+                        ordinary.probe,
+                        condition,
+                        permutations[batch_index],
+                    )
+                    state = _one_step_from_start(layer, ordinary.probe, start)
+                    altered = layer.merge_heads(state)
+                    for suffix in model.layers[layer_index + 1 :]:
+                        altered = suffix(altered).magnetizations
+                    logits = model.readout(altered)
+                    loss = float(
+                        F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+                    )
+                    rms, field_kl = _counterfactual_mismatch(
+                        layer, state, trace, ordinary.probe
+                    )
+                    row["initializer_loss_batches"][condition].append(loss)
+                    row["initializer_rms_batches"][condition].append(rms)
+                    row["initializer_field_kl_batches"][condition].append(field_kl)
+
+            if joint_batches is not None:
+                for condition in INTERVENTION_CONDITIONS:
+                    altered = model.embedding(token_ids)
+                    converged = True
+                    for layer in model.layers:
+                        altered, converged = _joint_horizon_output(
+                            layer, altered, condition
+                        )
+                        if not converged:
+                            converged = False
+                            break
+                    if converged:
+                        logits = model.readout(altered)
+                        loss = float(
+                            F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+                        )
+                    else:
+                        loss = math.nan
+                    joint_batches[condition].append(loss)
+    finally:
+        model.train(was_training)
+
+    baseline = _mean(baseline_batches)
+    layers = []
+    for layer_index in selected_layers:
+        row = records[layer_index]
+        loss = {
+            condition: _mean(row["loss_batches"][condition])
+            for condition in INTERVENTION_CONDITIONS
+        }
+        loss_delta_batches = {
+            condition: [
+                altered - ordinary
+                for altered, ordinary in zip(
+                    row["loss_batches"][condition], baseline_batches
+                )
+            ]
+            for condition in INTERVENTION_CONDITIONS
+        }
+        initializer_loss = {
+            condition: _mean(row["initializer_loss_batches"][condition])
+            for condition in INITIALIZER_CAUSAL_CONDITIONS
+        }
+        initializer_loss_delta_batches = {
+            condition: [
+                altered - ordinary
+                for altered, ordinary in zip(
+                    row["initializer_loss_batches"][condition], baseline_batches
+                )
+            ]
+            for condition in INITIALIZER_CAUSAL_CONDITIONS
+        }
+        layers.append(
+            {
+                "layer": layer_index + 1,
+                "loss": loss,
+                "loss_delta": {
+                    horizon: _mean(values)
+                    for horizon, values in loss_delta_batches.items()
+                },
+                "loss_delta_batches": loss_delta_batches,
+                "rms": {
+                    condition: _mean(row["rms_batches"][condition])
+                    for condition in INTERVENTION_CONDITIONS
+                },
+                "field_kl": {
+                    condition: _mean(row["field_kl_batches"][condition])
+                    for condition in INTERVENTION_CONDITIONS
+                },
+                "initializer_causal": {
+                    "loss": initializer_loss,
+                    "loss_delta": {
+                        condition: _mean(values)
+                        for condition, values in initializer_loss_delta_batches.items()
+                    },
+                    "loss_delta_batches": initializer_loss_delta_batches,
+                    "rms": {
+                        condition: _mean(row["initializer_rms_batches"][condition])
+                        for condition in INITIALIZER_CAUSAL_CONDITIONS
+                    },
+                    "field_kl": {
+                        condition: _mean(row["initializer_field_kl_batches"][condition])
+                        for condition in INITIALIZER_CAUSAL_CONDITIONS
+                    },
+                },
+                "fixed_point_converged_fraction": sum(row["converged"])
+                / len(row["converged"]),
+                "fixed_point_residual_batches": row["fixed_point_residual"],
+                "fixed_point_residual_max": max(row["fixed_point_residual"]),
+            }
+        )
+
+    joint = None
+    if joint_batches is not None:
+        joint = {
+            "loss": {
+                condition: _mean(joint_batches[condition])
+                for condition in INTERVENTION_CONDITIONS
+            },
+            "loss_delta": {
+                condition: _mean(
+                    [
+                        altered - ordinary
+                        for altered, ordinary in zip(
+                            joint_batches[condition], baseline_batches
+                        )
+                    ]
+                )
+                for condition in INTERVENTION_CONDITIONS
+            },
+            "loss_delta_batches": {
+                condition: [
+                    altered - ordinary
+                    for altered, ordinary in zip(
+                        joint_batches[condition], baseline_batches
+                    )
+                ]
+                for condition in INTERVENTION_CONDITIONS
+            },
+        }
+    return {"baseline_loss": baseline, "layers": layers, "joint": joint}
+
+
 @torch.no_grad()
 def generate(
     model,
@@ -512,7 +853,11 @@ def train(depth, train_tokens, valid_tokens, vocabulary, args):
         "probe": [],
         "samples": [],
         "layer_ablation": None,
+        "relaxation_interventions": [],
     }
+    intervention_enabled = depth in args.intervention_depths
+    intervention_steps = set(args.intervention_steps) if intervention_enabled else set()
+    intervention_checkpoints = {}
     started = time.time()
     print(f"\ndepth {depth}: {parameters:,} parameters on {args.device}")
 
@@ -537,6 +882,20 @@ def train(depth, train_tokens, valid_tokens, vocabulary, args):
         f"initial valid {initial_valid:.3f}\n\n"
         f"Sample, depth {depth}, step 0:\n{initial_sample}\n"
     )
+    if 0 in intervention_steps:
+        measured = evaluate_relaxation_interventions(
+            model,
+            valid_tokens,
+            args,
+            args.seed + 30_000,
+            all_layers=False,
+        )
+        history["relaxation_interventions"].append({"step": 0} | measured)
+        if args.save_intervention_checkpoints:
+            intervention_checkpoints["0"] = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
 
     for step in range(1, args.steps + 1):
         inspect = step == 1 or step == args.steps or step % args.log_every == 0
@@ -561,6 +920,30 @@ def train(depth, train_tokens, valid_tokens, vocabulary, args):
         optimizer.step()
         history["step"].append(step)
         history["train"].append(float(loss.detach()))
+
+        if step in intervention_steps:
+            measured = evaluate_relaxation_interventions(
+                model,
+                valid_tokens,
+                args,
+                args.seed + 30_000,
+                all_layers=step == args.steps,
+            )
+            history["relaxation_interventions"].append({"step": step} | measured)
+            if args.save_intervention_checkpoints:
+                intervention_checkpoints[str(step)] = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+            final_layer = measured["layers"][-1]
+            print(
+                "\nrelaxation intervention "
+                f"at depth {depth}, optimizer step {step}: "
+                + "  ".join(
+                    f"{condition} {final_layer['loss_delta'][condition]:+.3f}"
+                    for condition in INTERVENTION_CONDITIONS
+                )
+            )
 
         if inspect:
             valid = evaluate(model, valid_tokens, args, validation_seed)
@@ -638,18 +1021,23 @@ def train(depth, train_tokens, valid_tokens, vocabulary, args):
         "parameters": parameters,
         "seconds": time.time() - started,
         "history": history,
+        "intervention_checkpoints": intervention_checkpoints,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corpus", type=Path, default=common.ROOT / "data" / "pg28054.txt")
+    parser.add_argument(
+        "--corpus", type=Path, default=common.ROOT / "data" / "pg28054.txt"
+    )
     parser.add_argument(
         "--corpus-url",
         default=DEFAULT_CORPUS_URL,
         help="download source used only when --corpus does not exist; pass an empty value to disable",
     )
-    parser.add_argument("--output", type=Path, default=common.DATA / "language_model.pt")
+    parser.add_argument(
+        "--output", type=Path, default=common.DATA / "language_model.pt"
+    )
     parser.add_argument("--depths", default="3,6,12,24")
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -682,6 +1070,28 @@ def main() -> None:
         default=32,
         help="paired held-out batches for final per-layer skip diagnostics",
     )
+    parser.add_argument(
+        "--intervention-depths",
+        default="6",
+        help="model depths receiving K-intervention checkpoints, or 'none'",
+    )
+    parser.add_argument(
+        "--intervention-steps",
+        default="0,1,50,500,1500,3000",
+        help="post-update checkpoints; the final optimizer step is always added",
+    )
+    parser.add_argument(
+        "--intervention-batches",
+        type=int,
+        default=32,
+        help="fixed paired held-out batches used by every K intervention",
+    )
+    parser.add_argument(
+        "--save-intervention-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="persist model states at intervention checkpoints for offline expansion",
+    )
     parser.add_argument("--sample-tokens", type=int, default=80)
     parser.add_argument("--sample-every", type=int, default=40)
     parser.add_argument("--prompt", default="Aloysha remembers")
@@ -694,6 +1104,12 @@ def main() -> None:
 
     try:
         depths = list(dict.fromkeys(common.numbers(args.depths, int)))
+        args.intervention_depths = (
+            []
+            if args.intervention_depths.strip().lower() == "none"
+            else list(dict.fromkeys(common.numbers(args.intervention_depths, int)))
+        )
+        requested_intervention_steps = common.numbers(args.intervention_steps, int)
     except ValueError as error:
         parser.error(str(error))
     if not depths or min(depths) < 1:
@@ -702,17 +1118,29 @@ def main() -> None:
         parser.error("--dim / --heads must be an even integer")
     if args.steps < 1 or args.batch_size < 1 or args.seq_len < 1:
         parser.error("--steps, --batch-size, and --seq-len must be positive")
+    if args.intervention_depths and min(args.intervention_depths) < 1:
+        parser.error("--intervention-depths must contain positive integers")
+    if min(requested_intervention_steps) < 0:
+        parser.error("--intervention-steps must be non-negative")
+    args.intervention_steps = sorted(
+        {step for step in requested_intervention_steps if step <= args.steps}
+        | {args.steps}
+    )
     if not 0 < args.holdout < 1:
         parser.error("--holdout must lie strictly between 0 and 1")
     if args.lr <= 0 or args.clip_grad <= 0:
         parser.error("--lr and --clip-grad must be positive")
-    if min(
-        args.log_every,
-        args.eval_batches,
-        args.ablation_batches,
-        args.sample_tokens,
-        args.sample_every,
-    ) < 1:
+    if (
+        min(
+            args.log_every,
+            args.eval_batches,
+            args.ablation_batches,
+            args.intervention_batches,
+            args.sample_tokens,
+            args.sample_every,
+        )
+        < 1
+    ):
         parser.error("logging, evaluation, and sampling counts must be positive")
     if args.temperature <= 0 or args.top_k < 0:
         parser.error("--temperature must be positive and --top-k non-negative")
@@ -731,7 +1159,9 @@ def main() -> None:
         f"{len(valid_tokens):,} valid characters, vocab {len(vocabulary)}"
     )
     baselines = ngram_baselines(train_text, valid_text)
-    print("baselines: " + "  ".join(f"{n}-gram {ce:.3f}" for n, ce in baselines.items()))
+    print(
+        "baselines: " + "  ".join(f"{n}-gram {ce:.3f}" for n, ce in baselines.items())
+    )
     config = {
         key: str(value) if isinstance(value, (Path, torch.device)) else value
         for key, value in vars(args).items()
@@ -741,7 +1171,7 @@ def main() -> None:
         runs.append(train(depth, train_tokens, valid_tokens, vocabulary, args))
         common.save_data(
             {
-                "schema_version": 3,
+                "schema_version": 7,
                 "config": config,
                 "vocabulary": vocabulary,
                 "baselines": baselines,

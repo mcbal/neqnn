@@ -98,8 +98,7 @@ def sampled_masks(data: dict, column: int) -> dict[str, np.ndarray]:
     ergodicity = data.get("ergodicity")
     saturation = data.get("chain_saturation")
     broken = (
-        (as_numpy(ergodicity[column]) > 1.4)
-        & (as_numpy(saturation[column]) > 0.3)
+        (as_numpy(ergodicity[column]) > 1.4) & (as_numpy(saturation[column]) > 0.3)
         if ergodicity is not None and saturation is not None
         else np.zeros_like(failed)
     )
@@ -204,19 +203,29 @@ def plot_mean_field(
         ax=axes,
         shrink=0.88,
         extend="both",
-        label=(
-            "conservative relative discrepancy\n"
-            "max(error estimate, Monte Carlo resolution)"
-        ),
+        label="conservative relative discrepancy: max(error estimate, Monte Carlo resolution)",
     )
     candidates = [
         (
             "local",
-            Line2D([], [], color=common.INK, lw=1.25, label=r"local $\rho=1$"),
+            Line2D(
+                [],
+                [],
+                color=common.INK,
+                lw=1.25,
+                label=r"local contraction boundary  $\rho=1$",
+            ),
         ),
         (
             "critical",
-            Line2D([], [], color=common.INK, ls=":", lw=0.9, label=r"zero-drive $\beta_c(D)$"),
+            Line2D(
+                [],
+                [],
+                color=common.INK,
+                ls=":",
+                lw=0.9,
+                label=r"zero-drive contraction threshold  $\beta_c(D)$",
+            ),
         ),
         (
             "multi",
@@ -245,7 +254,7 @@ def plot_mean_field(
         fig.legend(
             handles=handles,
             loc="outside lower center",
-            ncol=min(4, len(handles)),
+            ncol=min(3, len(handles)),
             fontsize=7.5,
             frameon=True,
             facecolor="#e9e9e6",
@@ -288,9 +297,7 @@ def plot_large_d(data: dict, *, prefix: str, output_dir: Path | None) -> None:
             overlay_conditioning(ax, data, column, dim)
             masks = sampled_masks(data, column)
             mark_sampled_cells(ax, data, column, masks)
-            configure_axis(
-                ax, data["u"], data["beta"], xlabel=row == len(LABELS) - 1
-            )
+            configure_axis(ax, data["u"], data["beta"], xlabel=row == len(LABELS) - 1)
             summary = values
             if data.get("fine_contraction") is not None:
                 stable = as_numpy(data["fine_contraction"][column]) < 1.0
@@ -329,6 +336,90 @@ def plot_large_d(data: dict, *, prefix: str, output_dir: Path | None) -> None:
     common.save_figure(fig, f"{prefix}_large_d", output_dir)
 
 
+def plot_projection(data: dict, *, prefix: str, output_dir: Path | None) -> None:
+    """Explain which delayed-correlation errors entropy production can see."""
+    if "delayed_error_fraction" not in data:
+        print("artifact has no projection decomposition; skipping projection plot")
+        return
+
+    nearest = lambda values, target: min(
+        range(len(values)), key=lambda index: abs(values[index] - target)
+    )
+    ui, bi = nearest(data["u"], 1.0), nearest(data["beta"], 1.0)
+    dims = np.asarray(data["dims"])
+    delayed = as_numpy(data["sampled_error"]["delayed"])[:, bi, ui]
+    delayed_floor = as_numpy(data["sampling_floor"]["delayed"])[:, bi, ui]
+    projected = as_numpy(data["projected_error"])[:, bi, ui]
+    projected_floor = as_numpy(data["sampling_floor"]["entropy"])[:, bi, ui]
+    resolved = as_numpy(data["projection_resolved"])[:, bi, ui].astype(bool)
+
+    fig, (error_ax, fraction_ax) = plt.subplots(
+        1, 2, figsize=(9.2, 3.7), layout="constrained"
+    )
+    error_ax.plot(
+        dims,
+        np.maximum(delayed, delayed_floor),
+        color=common.ORANGE,
+        marker="o",
+        label=r"full $C^{del}$ error",
+    )
+    error_ax.plot(
+        dims,
+        np.maximum(projected, projected_floor),
+        color=common.BLUE,
+        marker="o",
+        label=r"projection onto $J-J^\mathsf{T}$",
+    )
+    error_ax.set(
+        xlabel="spin dimension $D$",
+        ylabel="conservative relative discrepancy",
+        yscale="log",
+        title="Full error versus visible projection",
+    )
+    error_ax.set_xticks(dims)
+    error_ax.legend()
+
+    bottoms = np.zeros(len(dims))
+    fractions = data["delayed_error_fraction"]
+    for key, color, label in (
+        ("symmetric", common.ORANGE, "symmetric · invisible"),
+        (
+            "antisymmetric_orthogonal",
+            common.GREEN,
+            "antisymmetric but orthogonal",
+        ),
+        ("parallel", common.BLUE, r"parallel to $J-J^\mathsf{T}$"),
+    ):
+        values = as_numpy(fractions[key])[:, bi, ui]
+        values = np.where(resolved, values, 0.0)
+        fraction_ax.bar(dims, values, bottom=bottoms, color=color, label=label)
+        bottoms += values
+    unresolved = ~resolved
+    if np.any(unresolved):
+        fraction_ax.scatter(
+            dims[unresolved],
+            np.full(unresolved.sum(), 0.5),
+            marker="x",
+            color=common.INK,
+            zorder=4,
+            label="MC floor-limited",
+        )
+    fraction_ax.set(
+        xlabel="spin dimension $D$",
+        ylabel="fraction of squared systematic error",
+        ylim=(0, 1),
+        title="Orthogonal error decomposition",
+    )
+    fraction_ax.set_xticks(dims)
+    fraction_ax.legend(fontsize=7.5)
+    fig.suptitle(
+        rf"Delayed-correlation projection at $u={data['u'][ui]:g}$, "
+        rf"$\beta={data['beta'][bi]:g}$",
+        fontsize=12,
+    )
+    common.save_figure(fig, f"{prefix}_projection", output_dir)
+
+
 def markdown_summary(data: dict, *, u: float = 1.0, beta: float = 1.0) -> str:
     """Return compact, blog-ready tables at the nearest sampled operating point."""
 
@@ -359,9 +450,7 @@ def markdown_summary(data: dict, *, u: float = 1.0, beta: float = 1.0) -> str:
         for column, dim in enumerate(data["dims"]):
             measured = float(as_numpy(data["sampled_error"][name])[column, bi, ui])
             floor = float(as_numpy(data["sampling_floor"][name])[column, bi, ui])
-            large_d = float(
-                as_numpy(data["large_d_error"][name])[column, fbi, fui]
-            )
+            large_d = float(as_numpy(data["large_d_error"][name])[column, fbi, fui])
             estimate = "floor-limited" if measured <= floor else percent(measured)
             lines.append(
                 f"| {dim} | {estimate} | {percent(floor)} | {percent(large_d)} |"
@@ -371,6 +460,34 @@ def markdown_summary(data: dict, *, u: float = 1.0, beta: float = 1.0) -> str:
     lines.append(
         "“Floor-limited” means the noise-corrected MF error did not exceed the Monte Carlo floor."
     )
+    if "delayed_error_fraction" in data:
+        lines.extend(
+            [
+                "",
+                "### Delayed-error projection",
+                "",
+                (
+                    "| D | symmetric and invisible | antisymmetric, orthogonal | "
+                    r"parallel to $J-J^\mathsf{T}$ |"
+                ),
+                "|---:|---:|---:|---:|",
+            ]
+        )
+        resolved = as_numpy(data["projection_resolved"])
+        fractions = data["delayed_error_fraction"]
+        for column, dim in enumerate(data["dims"]):
+            if not bool(resolved[column, bi, ui]):
+                lines.append(
+                    f"| {dim} | floor-limited | floor-limited | floor-limited |"
+                )
+                continue
+            values = [
+                float(as_numpy(fractions[name])[column, bi, ui])
+                for name in ("symmetric", "antisymmetric_orthogonal", "parallel")
+            ]
+            lines.append(
+                f"| {dim} | " + " | ".join(percent(value) for value in values) + " |"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -387,6 +504,7 @@ def plot(
         output_dir=output_dir,
     )
     plot_large_d(data, prefix=prefix, output_dir=output_dir)
+    plot_projection(data, prefix=prefix, output_dir=output_dir)
 
 
 def main() -> None:
