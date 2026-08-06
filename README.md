@@ -1,6 +1,6 @@
 # Nonequilibrium dynamics in spin-model transformers
 
-Companion experimental code and `neqnn` package for blog post [Nonequilibrium Dynamics in Spin-Model Transformers (Bal, 2026)](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
+Companion code and `neqnn` package for blog post [Nonequilibrium Dynamics in Spin-Model Transformers (Bal, 2026)](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
 
 ## Getting started
 
@@ -20,3 +20,5 @@ module = SpinModelTransformerModule(
 out = module(torch.randn(1, 32, 256))
 out.magnetizations        # magnetizations, (1, 32, 256)
 ```
+
+See the `experiments` scripts for examples on how to use and probe the module.
