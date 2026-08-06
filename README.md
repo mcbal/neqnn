@@ -1,7 +1,8 @@
-# 🧲 Nonequilibrium dynamics in spin-model transformers
+# Nonequilibrium dynamics in spin-model transformers
 
-Companion experimental code and `neqnn` package for
-[Nonequilibrium Dynamics in Spin-Model Transformers (Bal, 2026)](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
+Companion experimental code and `neqnn` package for blog post [Nonequilibrium Dynamics in Spin-Model Transformers (Bal, 2026)](https://mcbal.github.io/post/nonequilibrium-dynamics-in-spin-model-transformers/).
+
+## Getting started
 
 A `SpinModelTransformerModule` is an example implementation of a parallel transformer block whose forward pass performs one or more mean-field update steps following a drive quench.
 

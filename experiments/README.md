@@ -1,6 +1,8 @@
-# 🧲 Nonequilibrium dynamics in spin-model transformers / Experiments
+# Experiments
 
-To reproduce blog experiments:
+## Mean-field fidelity
+
+To reproduce the blog post experiments:
 
 ```bash
 uv run python experiments/fidelity_compute.py \
@@ -15,6 +17,10 @@ uv run python experiments/fidelity_plot.py \
   --output-dir experiments/figures --prefix fidelity
 
 ```
+
+## Toy autoregressive language model training
+
+To reproduce the blog post experiments:
 
 ```bash
 uv run python experiments/language_model_compute.py \
