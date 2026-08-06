@@ -129,6 +129,19 @@ def test_amortized_initializer_respects_the_head_radius():
     assert float(initial.detach().norm(dim=-1).max()) < module.radius_head
 
 
+def test_amortized_initializer_is_response_to_value_field():
+    module = SpinModelTransformerModule(
+        dim=32, num_heads=2, num_steps=1, init="amortized", beta=1.7
+    )
+    normalized = module.normalize(torch.randn(2, 5, 32))
+    initializer_field = module.split_heads(module.to_v(normalized))
+
+    assert torch.allclose(
+        module.initial(normalized, None),
+        vmf.response_large_d(initializer_field, module.beta),
+    )
+
+
 def test_probe_returns_the_ingredients_of_the_same_pass():
     """The probe must expose exactly what the forward consumed, not a re-run."""
     dim, num_heads, sites = 64, 4, 16

@@ -427,8 +427,9 @@ class SpinModelTransformerModule(nn.Module):
         - ``reset``     unmagnetized, M = 0.  The trivial start: carries nothing
           from the drive and nothing from history, so it is the control the
           other two are read against.
-        - ``amortized`` M = squash(X_t W_V), a learned physical guess at where
-          relaxation ends up.
+        - ``amortized`` H_0 = X_t W_V and M = phi_beta(H_0), a learned
+          initializer field mapped through the same physical response used by
+          every relaxation step.
         - ``carried``   M = M_{t-1,K} from the previous drive step, falling back
           to the amortized guess when there is no history, so the reset and
           carried columns differ only from t=1 on.
@@ -437,7 +438,8 @@ class SpinModelTransformerModule(nn.Module):
             return self.split_heads(torch.zeros_like(x))
         if self.init == "carried" and state is not None:
             return state.magnetizations
-        return vmf.magnetization_squash(self.split_heads(self.to_v(x)))
+        initializer_field = self.split_heads(self.to_v(x))
+        return vmf.response_large_d(initializer_field, self.beta)
 
     #
     # Relaxation
