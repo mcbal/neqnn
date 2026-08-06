@@ -144,7 +144,7 @@ class LanguageModel(nn.Module):
                 dim=dim,
                 num_heads=heads,
                 num_steps=1,
-                init="amortized",
+                init="learned",
                 # Token embeddings are physical fields.  Once the first module
                 # responds, subsequent layer inputs are magnetizations and may
                 # use the conjugate-field carrier.
@@ -360,7 +360,7 @@ def signals(model, activations, probes):
                 "entropy": entropy,
                 "entropy_fixed_point_residual": fixed_point.residual,
                 "entropy_fixed_point_converged": fixed_point.converged,
-                # One-step distributional change from the amortized value guess
+                # One-step distributional change from the learned value guess
                 # m_0 to the module output m_1. Unlike the fixed-point mismatch
                 # used by Relaxation, this needs no additional solve.
                 "relaxation_mismatch": float(relaxation_mismatch.float().mean()),
@@ -463,7 +463,7 @@ def _carrier_state(layer, probe):
 
     A field input must first respond through ``phi`` to become a magnetization;
     a magnetization input is already a physical state. This excludes the FFN,
-    attention interaction, and amortized value initializer.
+    attention interaction, and learned value initializer.
     """
     if layer.input_mode == "field":
         return vmf.response_large_d(probe.x, layer.beta)

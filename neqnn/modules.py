@@ -7,7 +7,7 @@ not ``dim``, is the D the large-D approximation is controlled by.
 
 Two independent binary choices span the design space:
 
-                    | reset / amortized init   | carried init
+                    | reset / learned init     | carried init
     ----------------|--------------------------|---------------------------
     finite K        | stateless, transformer   | recurrent, stateful
     fixed point     | implicit, DEQ-like       | path-dependent branch choice
@@ -70,7 +70,7 @@ def advance(
 
     Arriving sites are unmagnetized by default, which is the per-site version of
     the reset initialization: a token that just entered the window genuinely has
-    no relaxation history.  Pass ``fill`` to seed them with an amortized guess
+    no relaxation history.  Pass ``fill`` to seed them with a learned guess
     instead.
     """
     if not isinstance(drop, int) or isinstance(drop, bool) or drop < 0:
@@ -166,7 +166,7 @@ class SpinModelTransformerModule(nn.Module):
         dim: int,
         num_heads: int = 1,
         num_steps: int | None = 1,
-        init: Literal["reset", "amortized", "carried"] = "amortized",
+        init: Literal["reset", "learned", "carried"] = "learned",
         input_mode: Literal["field", "magnetization"] = "field",
         beta: float = 1.0,
         causal: bool = False,
@@ -198,9 +198,9 @@ class SpinModelTransformerModule(nn.Module):
                 "the spin-radius convention requires dim / num_heads > 2, "
                 f"got head dimension {dim_head}"
             )
-        if init not in {"reset", "amortized", "carried"}:
+        if init not in {"reset", "learned", "carried"}:
             raise ValueError(
-                f"init must be one of 'reset', 'amortized', or 'carried', got {init!r}"
+                f"init must be one of 'reset', 'learned', or 'carried', got {init!r}"
             )
         if input_mode not in {"field", "magnetization"}:
             raise ValueError(
@@ -356,7 +356,7 @@ class SpinModelTransformerModule(nn.Module):
         ``temperature / D``.
 
         ``normalized`` lets forward paths reuse their normalized input for the
-        amortized V initialization.  Diagnostic callers can omit it.
+        learned V initialization.  Diagnostic callers can omit it.
         """
         normalized = self.normalize(x) if normalized is None else normalized
         queries, keys = self.to_qk(normalized).chunk(2, dim=-1)
@@ -414,11 +414,11 @@ class SpinModelTransformerModule(nn.Module):
         - ``reset``     unmagnetized, M = 0.  The trivial start: carries nothing
           from the drive and nothing from history, so it is the control the
           other two are read against.
-        - ``amortized`` H_0 = X_t W_V and M = phi_beta(H_0), a learned
+        - ``learned``   H_0 = X_t W_V and M = phi_beta(H_0), a learned
           initializer field mapped through the same physical response used by
           every relaxation step.
         - ``carried``   M = M_{t-1,K} from the previous drive step, falling back
-          to the amortized guess when there is no history, so the reset and
+          to the learned guess when there is no history, so the reset and
           carried columns differ only from t=1 on.
         """
         if self.init == "reset":

@@ -9,7 +9,7 @@ from neqnn import SpinModelTransformerModule, advance, mean_field as mf, proxies
 
 
 @pytest.mark.parametrize("num_steps", [1, 4, None])
-@pytest.mark.parametrize("init", ["reset", "amortized", "carried"])
+@pytest.mark.parametrize("init", ["reset", "learned", "carried"])
 def test_every_quadrant_runs_forward_and_backward(num_steps, init):
     module = SpinModelTransformerModule(
         dim=64,
@@ -118,9 +118,9 @@ def test_conjugate_carrier_rejects_boundary_magnetizations():
         module(x)
 
 
-def test_amortized_initializer_respects_the_head_radius():
+def test_learned_initializer_respects_the_head_radius():
     module = SpinModelTransformerModule(
-        dim=128, num_heads=8, num_steps=1, init="amortized"
+        dim=128, num_heads=8, num_steps=1, init="learned"
     )
     with torch.no_grad():
         module.to_v.weight.mul_(1e4)
@@ -129,9 +129,9 @@ def test_amortized_initializer_respects_the_head_radius():
     assert float(initial.detach().norm(dim=-1).max()) < module.radius_head
 
 
-def test_amortized_initializer_is_response_to_value_field():
+def test_learned_initializer_is_response_to_value_field():
     module = SpinModelTransformerModule(
-        dim=32, num_heads=2, num_steps=1, init="amortized", beta=1.7
+        dim=32, num_heads=2, num_steps=1, init="learned", beta=1.7
     )
     normalized = module.normalize(torch.randn(2, 5, 32))
     initializer_field = module.split_heads(module.to_v(normalized))
@@ -146,7 +146,7 @@ def test_probe_returns_the_ingredients_of_the_same_pass():
     """The probe must expose exactly what the forward consumed, not a re-run."""
     dim, num_heads, sites = 64, 4, 16
     module = SpinModelTransformerModule(
-        dim=dim, num_heads=num_heads, num_steps=1, init="amortized", beta=1.0
+        dim=dim, num_heads=num_heads, num_steps=1, init="learned", beta=1.0
     )
     x = torch.randn(2, sites, dim)
     readout = module(x, probe=True)
@@ -205,7 +205,7 @@ def test_one_step_from_reset_cannot_see_the_couplings():
 def test_the_fixed_point_forgets_its_initialization():
     """At K -> inf the init is inert, so to_v receives no gradient at all."""
     module = SpinModelTransformerModule(
-        dim=64, num_steps=None, init="amortized", beta=1.0
+        dim=64, num_steps=None, init="learned", beta=1.0
     )
     module(torch.randn(2, 16, 64)).magnetizations.sum().backward()
     # Not merely zero: the solve runs under no_grad and the implicit gradient is
@@ -269,7 +269,7 @@ def test_relaxation_indices_match_the_forward_pass():
         dim=64,
         num_heads=2,
         num_steps=1,
-        init="amortized",
+        init="learned",
         causal=True,
         qk_bias=True,
         rope=True,
