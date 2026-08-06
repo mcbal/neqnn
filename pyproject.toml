@@ -4,7 +4,7 @@ requires = ["hatchling"]
 
 [project]
 name = "neqnn"
-version = "0.0.1"
+version = "0.1.0"
 description = "Nonequilibrium dynamics in spin-model transformers."
 authors = [{ name = "Matthias Bal", email = "matthiascbal@gmail.com" }]
 classifiers = [
@@ -23,9 +23,6 @@ dependencies = [
     "numpy>=2.4.2",
     "torch>=2.10.0",
 ]
-
-[project.optional-dependencies]
-webcam = ["opencv-python>=4.10"]
 
 [dependency-groups]
 dev = ["matplotlib>=3.10.0", "pytest>=8.0", "scipy>=1.14"]
