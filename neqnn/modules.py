@@ -266,9 +266,7 @@ class SpinModelTransformerModule(nn.Module):
         # Attention sharpness. With normalized Q/K the learned scalar is the
         # entire logit scale. Keep the established sqrt(D_head) operating point;
         # unlike the physical response scale this is a neural-network parameter,
-        # not something bounded by R. Its magnitude is used in the forward pass
-        # so optimization cannot silently turn similarity attention into
-        # anti-similarity attention.
+        # not something bounded by R.
         self.attn_temperature = nn.Parameter(torch.tensor(float(self.dim_head) ** 0.5))
 
         # Disabling drops the memory term from the drive entirely.

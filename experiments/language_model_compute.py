@@ -152,7 +152,6 @@ class LanguageModel(nn.Module):
                 input_mode="field" if layer_index == 0 else input_mode,
                 beta=1.0,
                 causal=True,
-                qk_bias=True,
                 rope=True,
             )
             for layer_index in range(depth)
