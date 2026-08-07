@@ -690,7 +690,7 @@ def plot_relaxation_interventions(
         fontsize=7.5,
     )
     axes[1].set(
-        title="Each layer follows its own relaxation path",
+        title="Relaxation beyond trained horizon decreases performance",
         ylabel=r"held-out $\mathrm{CE}-\mathrm{CE}(K=1)$",
     )
     axes[1].text(
