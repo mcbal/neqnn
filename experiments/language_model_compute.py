@@ -1094,7 +1094,7 @@ def main() -> None:
     )
     parser.add_argument("--sample-tokens", type=int, default=80)
     parser.add_argument("--sample-every", type=int, default=40)
-    parser.add_argument("--prompt", default="Aloysha remembers")
+    parser.add_argument("--prompt", default="Alyosha remembers")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
